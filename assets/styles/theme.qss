@@ -1,0 +1,42 @@
+/* OmniTranslator Pro Global QSS Theme Override */
+
+QMainWindow {
+    background-color: #121214;
+}
+
+QTabWidget::pane {
+    border: 1px solid #2E2E32;
+    background-color: #1A1A1E;
+}
+
+QTabBar::tab {
+    background: #18181C;
+    border: 1px solid #2E2E32;
+    padding: 8px 16px;
+    color: #A0A0AA;
+    border_top_left_radius: 4px;
+    border_top_right_radius: 4px;
+}
+
+QTabBar::tab:selected {
+    background: #25252A;
+    color: #8E75FF;
+    border_bottom_color: #8E75FF;
+}
+
+QPushButton {
+    background-color: #8E75FF;
+    color: #FFFFFF;
+    font-weight: bold;
+    border-radius: 6px;
+    padding: 6px 14px;
+}
+
+QPushButton:hover {
+    background-color: #9F8BFF;
+}
+
+QPushButton:disabled {
+    background-color: #3A3A42;
+    color: #71717A;
+}

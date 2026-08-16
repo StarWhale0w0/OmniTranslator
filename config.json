@@ -1,0 +1,13 @@
+{
+  "api_keys": [],
+  "current_model": "gemini-2.5-flash",
+  "temperature": 0.7,
+  "top_p": 0.9,
+  "thinking_level": "high",
+  "default_language": "JA",
+  "max_workers": 4,
+  "rpm_limit": 60,
+  "enable_prefill": true,
+  "enable_postprocess": true,
+  "enable_glossary": true
+}
