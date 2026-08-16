@@ -1,0 +1,25 @@
+# Security & Configuration
+config.json
+*.meta.json
+.env
+*.key
+
+# Python Bytecode & Cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Build & Dist
+build/
+dist/
+*.spec.bak
+
+# Logs & Temporary Files
+logs/
+*.log
+scratch/
+tmp/
+.vscode/
+.idea/
