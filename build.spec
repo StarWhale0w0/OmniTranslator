@@ -15,7 +15,6 @@ a = Analysis(
         'PySide6.QtGui',
         'PySide6.QtWidgets',
         'qasync',
-        'qdarktheme',
         'google.genai',
         'bs4',
         'ebooklib'

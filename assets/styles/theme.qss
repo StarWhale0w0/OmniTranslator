@@ -1,12 +1,74 @@
-/* OmniTranslator Pro Global QSS Theme Override */
+/* OmniTranslator Pro Global Dark Theme QSS */
+
+QWidget {
+    background-color: #121214;
+    color: #E1E1E6;
+    font-family: "Segoe UI", "맑은 고딕", sans-serif;
+    font-size: 13px;
+}
 
 QMainWindow {
     background-color: #121214;
 }
 
+QDialog {
+    background-color: #1A1A1E;
+}
+
+QGroupBox {
+    border: 1px solid #2E2E32;
+    border-radius: 6px;
+    margin-top: 10px;
+    padding-top: 10px;
+    font-weight: bold;
+    color: #8E75FF;
+}
+
+QGroupBox::title {
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    padding: 0 6px;
+    background-color: #121214;
+}
+
+QLineEdit, QPlainTextEdit, QSpinBox, QDoubleSpinBox, QComboBox {
+    background-color: #18181C;
+    border: 1px solid #2E2E32;
+    border-radius: 4px;
+    padding: 6px;
+    color: #E1E1E6;
+    selection-background-color: #8E75FF;
+}
+
+QLineEdit:focus, QPlainTextEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {
+    border: 1px solid #8E75FF;
+}
+
+QPushButton {
+    background-color: #8E75FF;
+    color: #FFFFFF;
+    font-weight: bold;
+    border-radius: 6px;
+    padding: 6px 14px;
+}
+
+QPushButton:hover {
+    background-color: #9F8BFF;
+}
+
+QPushButton:pressed {
+    background-color: #795EFF;
+}
+
+QPushButton:disabled {
+    background-color: #2E2E32;
+    color: #71717A;
+}
+
 QTabWidget::pane {
     border: 1px solid #2E2E32;
     background-color: #1A1A1E;
+    border-radius: 6px;
 }
 
 QTabBar::tab {
@@ -22,21 +84,54 @@ QTabBar::tab:selected {
     background: #25252A;
     color: #8E75FF;
     border_bottom_color: #8E75FF;
+    font-weight: bold;
 }
 
-QPushButton {
-    background-color: #8E75FF;
+QProgressBar {
+    border: 1px solid #2E2E32;
+    border-radius: 6px;
+    text-align: center;
+    background-color: #18181C;
     color: #FFFFFF;
     font-weight: bold;
-    border-radius: 6px;
-    padding: 6px 14px;
 }
 
-QPushButton:hover {
-    background-color: #9F8BFF;
+QProgressBar::chunk {
+    background-color: #8E75FF;
+    border-radius: 5px;
 }
 
-QPushButton:disabled {
-    background-color: #3A3A42;
-    color: #71717A;
+QTableWidget {
+    background-color: #18181C;
+    gridline-color: #2E2E32;
+    border: 1px solid #2E2E32;
+    border-radius: 4px;
+}
+
+QHeaderView::section {
+    background-color: #25252A;
+    color: #8E75FF;
+    padding: 6px;
+    border: 1px solid #2E2E32;
+    font-weight: bold;
+}
+
+QScrollBar:vertical {
+    background: #121214;
+    width: 10px;
+    margin: 0px;
+}
+
+QScrollBar::handle:vertical {
+    background: #2E2E32;
+    min-height: 20px;
+    border-radius: 5px;
+}
+
+QScrollBar::handle:vertical:hover {
+    background: #8E75FF;
+}
+
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    height: 0px;
 }
