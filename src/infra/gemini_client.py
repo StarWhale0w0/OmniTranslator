@@ -1,5 +1,5 @@
 """
-OmniTranslator Pro - Gemini API Client with Async Support & Model Refresh
+OmniTranslator Pro - Gemini API Client with Async Support & Model Discovery
 """
 
 import asyncio
@@ -33,20 +33,38 @@ class GeminiClient:
     @classmethod
     def list_available_models(cls, api_key: str) -> List[str]:
         """Queries Gemini API for available text generation models."""
-        if not api_key:
-            return cls.DEFAULT_FALLBACK_MODELS
+        if not api_key or not api_key.strip():
+            raise ValueError("API 키가 입력되지 않았습니다.")
+
+        client = genai.Client(api_key=api_key.strip())
+        models = []
+        excluded_keywords = ["embedding", "imagen", "aqa", "tts", "audio", "bison", "gecko"]
+
         try:
-            client = genai.Client(api_key=api_key)
-            models = []
             for m in client.models.list():
-                name = m.name.replace("models/", "") if hasattr(m, "name") else str(m)
-                if "gemini" in name.lower() and "vision" not in name.lower():
-                    models.append(name)
-            logger.info(f"Successfully fetched {len(models)} models from Gemini API.")
-            return models if models else cls.DEFAULT_FALLBACK_MODELS
+                raw_name = getattr(m, "name", str(m))
+                clean_name = raw_name.replace("models/", "").strip()
+
+                supported_methods = getattr(m, "supported_generation_methods", None) or getattr(m, "supported_actions", None) or []
+                if supported_methods and "generateContent" not in supported_methods:
+                    continue
+
+                name_lower = clean_name.lower()
+                if any(k in name_lower for k in excluded_keywords):
+                    continue
+
+                if clean_name and clean_name not in models:
+                    models.append(clean_name)
         except Exception as e:
-            logger.warning(f"Failed to query model list from API ({e}). Using fallback list.")
-            return cls.DEFAULT_FALLBACK_MODELS
+            logger.error(f"Failed to query model list from Gemini API: {e}")
+            raise RuntimeError(f"Gemini API 모델 목록 조회 실패: {e}") from e
+
+        if not models:
+            raise ValueError("해당 API 키로 사용 가능한 텍스트 생성 모델을 찾을 수 없습니다.")
+
+        models.sort(key=lambda x: x.lower())
+        logger.info(f"Successfully fetched {len(models)} Gemini models: {models}")
+        return models
 
     async def generate_text_async(
         self,

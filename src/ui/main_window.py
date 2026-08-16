@@ -8,6 +8,7 @@ from pathlib import Path
 from PySide6 import QtWidgets, QtCore
 
 from common.paths import get_app_data_path
+from common.config_loader import ConfigLoader
 from common.logger import setup_logger
 from ui.signals import TranslationSignals
 from ui.settings_dialog import SettingsDialog
@@ -27,31 +28,29 @@ class MainWindow(QtWidgets.QMainWindow):
         super().__init__(parent)
         self.loop = loop
         self.signals = TranslationSignals()
-        self.config = self._load_config()
+        self.config = ConfigLoader.load_or_init_config()
         self.orchestrator = TranslationOrchestrator(self.signals, self.config)
 
         self.setWindowTitle("OmniTranslator Pro - 통합 배치 번역 시스템")
         self.resize(1150, 850)
         self._init_ui()
         self._wire_signals()
+        
+        # Check API Keys on startup
+        QtCore.QTimer.singleShot(500, self._check_initial_api_keys)
 
-    def _load_config(self) -> dict:
-        config_path = get_app_data_path("config.json")
-        if config_path.exists():
-            try:
-                with open(config_path, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            except Exception:
-                pass
-        return {
-            "api_keys": [],
-            "translation_model": "gemini-2.5-flash",
-            "glossary_model": "gemini-2.5-flash",
-            "max_workers": 4,
-            "chunk_size": 4000,
-            "request_delay": 0.5,
-            "use_dynamic_glossary": True
-        }
+    def _check_initial_api_keys(self):
+        """Displays startup warning if API keys are missing."""
+        if not self.config.get("api_keys"):
+            self.status_label.setText("⚠️ API 키가 등록되지 않았습니다. [⚙️ 설정]에서 키를 등록해주세요.")
+            res = QtWidgets.QMessageBox.warning(
+                self,
+                "API 키 등록 필요",
+                "API 키가 등록되지 않았습니다.\n지금 [⚙️ 설정] 창을 열어 Gemini API 키를 등록하시겠습니까?",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No
+            )
+            if res == QtWidgets.QMessageBox.Yes:
+                self._open_settings()
 
     def _init_ui(self):
         main_widget = QtWidgets.QWidget()
@@ -96,7 +95,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setFormat("%p% (%v/%m Chunks)")
         self.progress_bar.setAlignment(QtCore.Qt.AlignCenter)
-        self.status_label = QtWidgets.QLabel("대기 중")
+        self.status_label = QtWidgets.QLabel("준비됨")
 
         dash_layout.addWidget(self.progress_bar)
         dash_layout.addWidget(self.status_label)
@@ -167,7 +166,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _open_settings(self):
         dialog = SettingsDialog(self)
         if dialog.exec() == QtWidgets.QDialog.Accepted:
-            self.config = self._load_config()
+            self.config = ConfigLoader.load_or_init_config()
             self.orchestrator.key_manager.set_api_keys(self.config.get("api_keys", []))
             self.orchestrator.key_manager.set_request_delay(self.config.get("request_delay", 0.5))
             self.orchestrator.config = self.config

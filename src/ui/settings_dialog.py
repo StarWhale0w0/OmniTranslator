@@ -3,14 +3,15 @@ OmniTranslator Pro - Seamarine-Style Quick Settings Modal Dialog
 Supports General Settings and Prompt/Prefill Management tabs.
 """
 
-import json
-from pathlib import Path
 from PySide6 import QtWidgets, QtCore
-from common.paths import get_app_data_path
+from common.config_loader import ConfigLoader
+from common.logger import setup_logger
 from infra.gemini_client import GeminiClient
 from domain.profiles.ja_profile import DEFAULT_SYSTEM_PROMPT as JA_DEFAULT
 from domain.profiles.zh_profile import DEFAULT_SYSTEM_PROMPT as ZH_DEFAULT
 from domain.profiles.en_profile import DEFAULT_SYSTEM_PROMPT as EN_DEFAULT
+
+logger = setup_logger("SettingsDialog")
 
 class SettingsDialog(QtWidgets.QDialog):
     """Quick settings modal popup window with TabWidget."""
@@ -25,7 +26,6 @@ class SettingsDialog(QtWidgets.QDialog):
         super().__init__(parent)
         self.setWindowTitle("⚙️ 빠른 번역 설정 (Quick Settings)")
         self.resize(600, 600)
-        self.config_path = get_app_data_path("config.json")
         
         self.prompts_data = {
             "JA": {"system_prompt": JA_DEFAULT, "custom_rules": ""},
@@ -58,12 +58,12 @@ class SettingsDialog(QtWidgets.QDialog):
         self.glossary_model_combo = QtWidgets.QComboBox()
         self.glossary_model_combo.addItems(GeminiClient.DEFAULT_FALLBACK_MODELS)
 
-        refresh_models_btn = QtWidgets.QPushButton("🔄 모델 새로고침")
-        refresh_models_btn.clicked.connect(self._refresh_models)
+        self.refresh_models_btn = QtWidgets.QPushButton("🔄 모델 새로고침")
+        self.refresh_models_btn.clicked.connect(self._refresh_models)
 
         models_row = QtWidgets.QHBoxLayout()
         models_row.addWidget(self.trans_model_combo)
-        models_row.addWidget(refresh_models_btn)
+        models_row.addWidget(self.refresh_models_btn)
 
         self.workers_spin = QtWidgets.QSpinBox()
         self.workers_spin.setRange(1, 20)
@@ -172,25 +172,46 @@ class SettingsDialog(QtWidgets.QDialog):
         main_layout.addWidget(btn_box)
 
     def _refresh_models(self):
-        keys = [k.strip() for k in self.api_keys_text.toPlainText().splitlines() if k.strip()]
-        first_key = keys[0] if keys else ""
-        fetched = GeminiClient.list_available_models(first_key)
+        typed_keys = [k.strip() for k in self.api_keys_text.toPlainText().splitlines() if k.strip()]
+        if not typed_keys:
+            QtWidgets.QMessageBox.warning(self, "API 키 필요", "모델 목록을 조회하려면 'API Key 목록' 필드에 최소 1개의 API 키를 입력하세요.")
+            return
 
-        curr_trans = self.trans_model_combo.currentText()
-        curr_gloss = self.glossary_model_combo.currentText()
+        api_key = typed_keys[0]
 
-        self.trans_model_combo.clear()
-        self.glossary_model_combo.clear()
+        self.refresh_models_btn.setEnabled(False)
+        self.refresh_models_btn.setText("조회 중...")
+        QtWidgets.QApplication.processEvents()
 
-        self.trans_model_combo.addItems(fetched)
-        self.glossary_model_combo.addItems(fetched)
+        try:
+            fetched = GeminiClient.list_available_models(api_key)
 
-        if curr_trans in fetched:
-            self.trans_model_combo.setCurrentText(curr_trans)
-        if curr_gloss in fetched:
-            self.glossary_model_combo.setCurrentText(curr_gloss)
+            curr_trans = self.trans_model_combo.currentText()
+            curr_gloss = self.glossary_model_combo.currentText()
 
-        QtWidgets.QMessageBox.information(self, "새로고침 완료", f"{len(fetched)}개의 Gemini 모델 목록을 불러왔습니다.")
+            self.trans_model_combo.clear()
+            self.glossary_model_combo.clear()
+
+            self.trans_model_combo.addItems(fetched)
+            self.glossary_model_combo.addItems(fetched)
+
+            if curr_trans in fetched:
+                self.trans_model_combo.setCurrentText(curr_trans)
+            if curr_gloss in fetched:
+                self.glossary_model_combo.setCurrentText(curr_gloss)
+
+            QtWidgets.QMessageBox.information(
+                self, "새로고침 성공", f"성공적으로 {len(fetched)}개의 최신 Gemini 모델 목록을 불러왔습니다!"
+            )
+        except Exception as e:
+            logger.error(f"Failed to query Gemini models: {e}")
+            QtWidgets.QMessageBox.critical(
+                self, "모델 새로고침 실패",
+                f"Gemini API 모델 목록을 조회하는 중 오류가 발생했습니다:\n\n{e}\n\nAPI 키의 유효성을 확인해주세요."
+            )
+        finally:
+            self.refresh_models_btn.setEnabled(True)
+            self.refresh_models_btn.setText("🔄 모델 새로고침")
 
     def _on_prompt_lang_changed(self, index: int):
         self._sync_current_prompt_ui_to_memory()
@@ -218,34 +239,29 @@ class SettingsDialog(QtWidgets.QDialog):
         self._sync_current_prompt_ui_to_memory()
 
     def _load_config(self):
-        if self.config_path.exists():
-            try:
-                with open(self.config_path, 'r', encoding='utf-8') as f:
-                    cfg = json.load(f)
-                    keys = cfg.get("api_keys", [])
-                    self.api_keys_text.setPlainText("\n".join(keys))
-                    
-                    self.trans_model_combo.setCurrentText(cfg.get("translation_model", "gemini-2.5-flash"))
-                    self.glossary_model_combo.setCurrentText(cfg.get("glossary_model", "gemini-2.5-flash"))
-                    self.workers_spin.setValue(cfg.get("max_workers", 4))
-                    self.chunk_size_spin.setValue(cfg.get("chunk_size", 4000))
-                    self.delay_spin.setValue(cfg.get("request_delay", 0.5))
-                    self.temp_spin.setValue(cfg.get("temperature", 0.7))
-                    self.thinking_combo.setCurrentText(cfg.get("thinking_level", "high"))
-                    self.use_dynamic_glossary_check.setChecked(cfg.get("use_dynamic_glossary", True))
+        cfg = ConfigLoader.load_or_init_config()
+        keys = cfg.get("api_keys", [])
+        self.api_keys_text.setPlainText("\n".join(keys))
+        
+        self.trans_model_combo.setCurrentText(cfg.get("translation_model", "gemini-2.5-flash"))
+        self.glossary_model_combo.setCurrentText(cfg.get("glossary_model", "gemini-2.5-flash"))
+        self.workers_spin.setValue(cfg.get("max_workers", 4))
+        self.chunk_size_spin.setValue(cfg.get("chunk_size", 4000))
+        self.delay_spin.setValue(cfg.get("request_delay", 0.5))
+        self.temp_spin.setValue(cfg.get("temperature", 0.7))
+        self.thinking_combo.setCurrentText(cfg.get("thinking_level", "high"))
+        self.use_dynamic_glossary_check.setChecked(cfg.get("use_dynamic_glossary", True))
 
-                    self.prefill_check.setChecked(cfg.get("enable_prefill", True))
-                    self.prefill_text_edit.setPlainText(cfg.get("prefill_text", "(Understood. I am operating in a private session. I will translate all content with complete fidelity preserving terms and style.)"))
+        self.prefill_check.setChecked(cfg.get("enable_prefill", True))
+        self.prefill_text_edit.setPlainText(cfg.get("prefill_text", "(Understood. I am operating in a private session. I will translate all content with complete fidelity preserving terms and style.)"))
 
-                    saved_prompts = cfg.get("prompts", {})
-                    for l_code in ["JA", "ZH", "EN"]:
-                        if l_code in saved_prompts:
-                            self.prompts_data[l_code] = {
-                                "system_prompt": saved_prompts[l_code].get("system_prompt", self.DEFAULTS[l_code]),
-                                "custom_rules": saved_prompts[l_code].get("custom_rules", "")
-                            }
-            except Exception:
-                pass
+        saved_prompts = cfg.get("prompts", {})
+        for l_code in ["JA", "ZH", "EN"]:
+            if l_code in saved_prompts:
+                self.prompts_data[l_code] = {
+                    "system_prompt": saved_prompts[l_code].get("system_prompt", self.DEFAULTS[l_code]),
+                    "custom_rules": saved_prompts[l_code].get("custom_rules", "")
+                }
         self._load_prompt_memory_to_ui()
 
     def _save_config(self):
@@ -266,6 +282,5 @@ class SettingsDialog(QtWidgets.QDialog):
             "prefill_text": self.prefill_text_edit.toPlainText().strip(),
             "prompts": self.prompts_data
         }
-        with open(self.config_path, 'w', encoding='utf-8') as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        ConfigLoader.save_config(cfg)
         self.accept()
