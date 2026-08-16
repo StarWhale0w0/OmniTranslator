@@ -171,6 +171,24 @@ class SettingsDialog(QtWidgets.QDialog):
         main_layout.addWidget(self.tab_widget)
         main_layout.addWidget(btn_box)
 
+    @staticmethod
+    def _set_combo_model(combo: QtWidgets.QComboBox, model_name: str) -> None:
+        """Safely sets combobox selection, dynamically adding model_name if missing."""
+        if not model_name:
+            return
+
+        cleaned = model_name.replace("models/", "").strip()
+        idx = combo.findText(cleaned)
+        if idx >= 0:
+            combo.setCurrentIndex(idx)
+        else:
+            combo.addItem(cleaned)
+            combo.setCurrentText(cleaned)
+
+    def load_settings(self):
+        """Public alias to reload latest settings from ConfigLoader."""
+        self._load_config()
+
     def _refresh_models(self):
         typed_keys = [k.strip() for k in self.api_keys_text.toPlainText().splitlines() if k.strip()]
         if not typed_keys:
@@ -179,6 +197,10 @@ class SettingsDialog(QtWidgets.QDialog):
 
         api_key = typed_keys[0]
 
+        # Remember currently selected models before clear
+        curr_trans = self.trans_model_combo.currentText().replace("models/", "").strip()
+        curr_gloss = self.glossary_model_combo.currentText().replace("models/", "").strip()
+
         self.refresh_models_btn.setEnabled(False)
         self.refresh_models_btn.setText("조회 중...")
         QtWidgets.QApplication.processEvents()
@@ -186,19 +208,15 @@ class SettingsDialog(QtWidgets.QDialog):
         try:
             fetched = GeminiClient.list_available_models(api_key)
 
-            curr_trans = self.trans_model_combo.currentText()
-            curr_gloss = self.glossary_model_combo.currentText()
-
             self.trans_model_combo.clear()
             self.glossary_model_combo.clear()
 
             self.trans_model_combo.addItems(fetched)
             self.glossary_model_combo.addItems(fetched)
 
-            if curr_trans in fetched:
-                self.trans_model_combo.setCurrentText(curr_trans)
-            if curr_gloss in fetched:
-                self.glossary_model_combo.setCurrentText(curr_gloss)
+            # Restore previously selected models safely
+            self._set_combo_model(self.trans_model_combo, curr_trans)
+            self._set_combo_model(self.glossary_model_combo, curr_gloss)
 
             QtWidgets.QMessageBox.information(
                 self, "새로고침 성공", f"성공적으로 {len(fetched)}개의 최신 Gemini 모델 목록을 불러왔습니다!"
@@ -243,8 +261,12 @@ class SettingsDialog(QtWidgets.QDialog):
         keys = cfg.get("api_keys", [])
         self.api_keys_text.setPlainText("\n".join(keys))
         
-        self.trans_model_combo.setCurrentText(cfg.get("translation_model", "gemini-2.5-flash"))
-        self.glossary_model_combo.setCurrentText(cfg.get("glossary_model", "gemini-2.5-flash"))
+        trans_model = cfg.get("translation_model", "gemini-2.5-flash")
+        gloss_model = cfg.get("glossary_model", "gemini-2.5-flash")
+
+        self._set_combo_model(self.trans_model_combo, trans_model)
+        self._set_combo_model(self.glossary_model_combo, gloss_model)
+
         self.workers_spin.setValue(cfg.get("max_workers", 4))
         self.chunk_size_spin.setValue(cfg.get("chunk_size", 4000))
         self.delay_spin.setValue(cfg.get("request_delay", 0.5))
@@ -267,11 +289,14 @@ class SettingsDialog(QtWidgets.QDialog):
     def _save_config(self):
         self._sync_current_prompt_ui_to_memory()
         keys = [k.strip() for k in self.api_keys_text.toPlainText().splitlines() if k.strip()]
+
+        trans_model = self.trans_model_combo.currentText().replace("models/", "").strip()
+        gloss_model = self.glossary_model_combo.currentText().replace("models/", "").strip()
         
         cfg = {
             "api_keys": keys,
-            "translation_model": self.trans_model_combo.currentText(),
-            "glossary_model": self.glossary_model_combo.currentText(),
+            "translation_model": trans_model,
+            "glossary_model": gloss_model,
             "max_workers": self.workers_spin.value(),
             "chunk_size": self.chunk_size_spin.value(),
             "request_delay": self.delay_spin.value(),
@@ -283,4 +308,5 @@ class SettingsDialog(QtWidgets.QDialog):
             "prompts": self.prompts_data
         }
         ConfigLoader.save_config(cfg)
+        logger.info(f"Settings saved successfully. translation_model='{trans_model}', glossary_model='{gloss_model}'")
         self.accept()

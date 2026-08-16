@@ -165,6 +165,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _open_settings(self):
         dialog = SettingsDialog(self)
+        dialog.load_settings()  # Explicitly load fresh configuration onto UI controls
         if dialog.exec() == QtWidgets.QDialog.Accepted:
             self.config = ConfigLoader.load_or_init_config()
             self.orchestrator.key_manager.set_api_keys(self.config.get("api_keys", []))
