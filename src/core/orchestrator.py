@@ -44,7 +44,8 @@ class TranslationOrchestrator(QtCore.QObject):
 
         self.key_manager = KeyManager(
             api_keys=self.config.get("api_keys", []),
-            requests_per_minute=self.config.get("rpm_limit", 60)
+            requests_per_minute=self.config.get("rpm_limit", 60),
+            request_delay=self.config.get("request_delay", 0.5)
         )
         self.gemini_client = GeminiClient(self.key_manager)
 
@@ -89,6 +90,18 @@ class TranslationOrchestrator(QtCore.QObject):
         is_epub = input_path.suffix.lower() == ".epub"
         chunker = self._get_chunker(is_epub)
 
+        # Update KeyManager delay settings
+        self.key_manager.set_request_delay(self.config.get("request_delay", 0.5))
+
+        # Retrieve system prompt & custom rules from config
+        prompt_cfg = self.config.get("prompts", {}).get(language.upper(), {})
+        base_sys_prompt = prompt_cfg.get("system_prompt", profile.get_system_instruction())
+        custom_rules = prompt_cfg.get("custom_rules", "").strip()
+
+        final_system_instruction = base_sys_prompt
+        if custom_rules:
+            final_system_instruction += f"\n\n## Additional User Custom Rules:\n{custom_rules}"
+
         # 1. Load Raw File Content
         if is_epub:
             raw_content = EpubIO.extract_epub_html_content(input_path)
@@ -96,20 +109,21 @@ class TranslationOrchestrator(QtCore.QObject):
             raw_content = TxtIO.read_text_file(input_path)
 
         # 2. Chunking
-        max_chunk_size = 2000 if is_epub else 6000
+        configured_chunk_size = self.config.get("chunk_size", 4000)
+        max_chunk_size = 2000 if is_epub else configured_chunk_size
         chunks = chunker.split_into_chunks(raw_content, max_size=max_chunk_size)
         total_chunks = len(chunks)
 
         translated_dict: Dict[int, str] = {}
         glossary_entries: List[Dict[str, Any]] = []
 
-        # Check existing checkpoint
+        # Check existing checkpoint for resume
         if resume_existing:
             ckpt = SessionManager.load_checkpoint(input_path)
             if ckpt and "translated_chunks" in ckpt:
                 translated_dict = ckpt["translated_chunks"]
                 glossary_entries = ckpt.get("glossary", [])
-                logger.info(f"Resuming job: {len(translated_dict)}/{total_chunks} chunks already done.")
+                logger.info(f"Resuming job: {len(translated_dict)}/{total_chunks} chunks already completed.")
 
         self.signals.progress.emit(len(translated_dict), total_chunks, "번역 준비 완료")
 
@@ -117,10 +131,13 @@ class TranslationOrchestrator(QtCore.QObject):
         start_time = time.time()
         max_workers = self.config.get("max_workers", 4)
         semaphore = asyncio.Semaphore(max_workers)
+        trans_model = self.config.get("translation_model", "gemini-2.5-flash")
+        use_glossary = self.config.get("use_dynamic_glossary", True)
+        prefill_text = self.config.get("prefill_text", "").strip()
 
         async def process_single_chunk(idx: int, text_chunk: str):
             if idx in translated_dict:
-                return  # Skip already translated
+                return  # Skip already translated chunk
 
             async with semaphore:
                 while self.is_paused and not self.cancel_requested:
@@ -129,8 +146,10 @@ class TranslationOrchestrator(QtCore.QObject):
                 if self.cancel_requested:
                     return
 
-                # Build prompt with Glossary & Prefill
-                glossary_context = GlossaryInjector.inject_glossary_context(text_chunk, glossary_entries)
+                # Build prompt with Dynamic Glossary Context
+                glossary_context = GlossaryInjector.inject_glossary_context(
+                    text_chunk, glossary_entries, enabled=use_glossary
+                )
                 prompt_str = profile.get_prompt_template().replace("{{slot}}", text_chunk).replace("{{glossary_context}}", glossary_context)
 
                 # Prepare contents & prefill history
@@ -138,10 +157,11 @@ class TranslationOrchestrator(QtCore.QObject):
                 if self.config.get("enable_prefill", True):
                     history_raw = profile.get_prefill_history()
                     for item in history_raw:
+                        p_text = prefill_text if item["role"] == "model" and prefill_text else item["parts"][0]
                         prompt_contents.append(
                             genai_types.Content(
                                 role=item["role"],
-                                parts=[genai_types.Part.from_text(text=p) for p in item["parts"]]
+                                parts=[genai_types.Part.from_text(text=p_text)]
                             )
                         )
                 prompt_contents.append(
@@ -151,10 +171,10 @@ class TranslationOrchestrator(QtCore.QObject):
                 try:
                     result_raw = await self.gemini_client.generate_text_async(
                         prompt_contents=prompt_contents,
-                        model_name=self.config.get("current_model", "gemini-2.5-flash"),
+                        model_name=trans_model,
                         temperature=self.config.get("temperature", 0.7),
                         top_p=self.config.get("top_p", 0.9),
-                        system_instruction=profile.get_system_instruction()
+                        system_instruction=final_system_instruction
                     )
 
                     # Postprocess Clean
@@ -173,11 +193,12 @@ class TranslationOrchestrator(QtCore.QObject):
                     speed = processed_count / elapsed if elapsed > 0 else 0.1
                     eta_sec = int((total_chunks - processed_count) / speed) if speed > 0 else 0
                     
-                    status_msg = f"처리 중 ({processed_count}/{total_chunks}) | 속도: {speed:.1f} 청크/s | ETA: {eta_sec}s"
+                    delay_info = f"딜레이: {self.key_manager.request_delay:.1f}s"
+                    status_msg = f"처리 중 ({processed_count}/{total_chunks} Chunks) | 속도: {speed:.1f} 청크/s | ETA: {eta_sec}s | {delay_info}"
                     self.signals.progress.emit(processed_count, total_chunks, status_msg)
                     self.signals.preview_updated.emit(text_chunk[:300], cleaned_result[:300])
 
-                    # Save checkpoint
+                    # Atomic Checkpoint Save
                     SessionManager.save_checkpoint(input_path, output_path, language, total_chunks, translated_dict, glossary_entries)
 
                 except Exception as e:

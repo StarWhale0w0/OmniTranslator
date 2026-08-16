@@ -10,17 +10,17 @@ from common.logger import setup_logger
 logger = setup_logger("KeyManager")
 
 class KeyManager:
-    """Manages pool of Gemini API keys, key rotation, and rate-limiting."""
+    """Manages pool of Gemini API keys, key rotation, request delay, and rate-limiting."""
 
     COOLDOWN_SECONDS = 100.0  # 100s penalty on RateLimit / QuotaExceeded error
 
-    def __init__(self, api_keys: Optional[List[str]] = None, requests_per_minute: float = 60.0):
+    def __init__(self, api_keys: Optional[List[str]] = None, requests_per_minute: float = 60.0, request_delay: float = 0.5):
         self.api_keys: List[str] = [k.strip() for k in api_keys if k.strip()] if api_keys else []
         self.current_index: int = 0
         self.key_cooldowns: Dict[str, float] = {}  # key -> timestamp when available again
         
         self.rpm = requests_per_minute
-        self.delay_between_requests = 60.0 / self.rpm if self.rpm > 0 else 0.0
+        self.request_delay = max(0.0, request_delay)
         self.last_request_time = 0.0
         self._rpm_lock = asyncio.Lock()
 
@@ -28,6 +28,10 @@ class KeyManager:
         self.api_keys = [k.strip() for k in keys if k.strip()]
         self.current_index = 0
         logger.info(f"API Key pool updated. Total keys: {len(self.api_keys)}")
+
+    def set_request_delay(self, delay: float) -> None:
+        self.request_delay = max(0.0, delay)
+        logger.info(f"Request delay updated to: {self.request_delay:.2f}s")
 
     def get_active_key(self) -> str:
         """Returns the next available non-cooldown API key."""
@@ -44,12 +48,10 @@ class KeyManager:
             if now >= cooldown_until:
                 return key
 
-            # Advance index to inspect next key
             self.current_index = (self.current_index + 1) % len(self.api_keys)
 
-        # All keys in cooldown
         wait_time = min(self.key_cooldowns.values()) - now
-        logger.warning(f"All API keys exhausted/cooldown. Shortest wait: {max(wait_time, 1.0):.1f}s")
+        logger.warning(f"All API keys in cooldown. Shortest wait: {max(wait_time, 1.0):.1f}s")
         return self.api_keys[start_index]
 
     def mark_key_failed(self, key: str, is_rate_limit: bool = True) -> str:
@@ -66,14 +68,12 @@ class KeyManager:
         return key
 
     async def acquire_rpm_slot(self) -> None:
-        """Enforces requests per minute (RPM) rate limits."""
-        if self.delay_between_requests <= 0:
-            return
-
+        """Enforces request delay and rate limits."""
         async with self._rpm_lock:
             now = time.time()
             elapsed = now - self.last_request_time
-            if elapsed < self.delay_between_requests:
-                wait_duration = self.delay_between_requests - elapsed
+            target_delay = max(self.request_delay, (60.0 / self.rpm) if self.rpm > 0 else 0.0)
+            if elapsed < target_delay:
+                wait_duration = target_delay - elapsed
                 await asyncio.sleep(wait_duration)
             self.last_request_time = time.time()

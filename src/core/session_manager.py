@@ -11,7 +11,7 @@ from common.logger import setup_logger
 logger = setup_logger("SessionManager")
 
 class SessionManager:
-    """Manages metadata serialization and checkpoint recovery for translation jobs."""
+    """Manages metadata serialization and atomic checkpoint recovery for translation jobs."""
 
     @classmethod
     def get_meta_filepath(cls, input_file_path: Path) -> Path:
@@ -28,6 +28,7 @@ class SessionManager:
         translated_chunks: Dict[int, str],
         glossary: List[Dict[str, Any]]
     ) -> Path:
+        """Atomic write of checkpoint data into .meta.json."""
         meta_path = cls.get_meta_filepath(input_file_path)
         data = {
             "input_file": str(input_file_path),
@@ -38,12 +39,15 @@ class SessionManager:
             "translated_chunks": {str(k): v for k, v in translated_chunks.items()},
             "glossary": glossary
         }
+        
+        temp_meta_path = meta_path.with_suffix(".tmp")
         try:
-            with open(meta_path, 'w', encoding='utf-8') as f:
+            with open(temp_meta_path, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
-            logger.debug(f"Checkpoint saved: {meta_path}")
+            temp_meta_path.replace(meta_path)  # Atomic replace
+            logger.debug(f"Atomic Checkpoint saved: {meta_path} ({len(translated_dict if 'translated_dict' in locals() else translated_chunks)} chunks)")
         except Exception as e:
-            logger.error(f"Failed to save checkpoint ({meta_path}): {e}")
+            logger.error(f"Failed to save atomic checkpoint ({meta_path}): {e}")
         return meta_path
 
     @classmethod
@@ -54,10 +58,9 @@ class SessionManager:
         try:
             with open(meta_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-                # Convert keys back to integer indices
                 if "translated_chunks" in data:
                     data["translated_chunks"] = {int(k): v for k, v in data["translated_chunks"].items()}
-                logger.info(f"Loaded existing checkpoint from {meta_path}")
+                logger.info(f"Loaded existing checkpoint from {meta_path} ({data.get('processed_count', 0)} chunks complete)")
                 return data
         except Exception as e:
             logger.error(f"Failed to load checkpoint ({meta_path}): {e}")

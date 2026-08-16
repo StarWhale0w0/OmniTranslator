@@ -1,5 +1,5 @@
 """
-OmniTranslator Pro - Gemini API Client with Async Support & Prefill
+OmniTranslator Pro - Gemini API Client with Async Support & Model Refresh
 """
 
 import asyncio
@@ -12,7 +12,14 @@ from common.logger import setup_logger
 logger = setup_logger("GeminiClient")
 
 class GeminiClient:
-    """High-level async Gemini client wrapping SDK calls, key rotation, and prefill."""
+    """High-level async Gemini client wrapping SDK calls, key rotation, and model discovery."""
+
+    DEFAULT_FALLBACK_MODELS = [
+        "gemini-2.5-flash",
+        "gemini-3-pro-preview",
+        "gemini-2.0-flash",
+        "gemini-2.0-pro"
+    ]
 
     def __init__(self, key_manager: KeyManager):
         self.key_manager = key_manager
@@ -22,6 +29,24 @@ class GeminiClient:
         if api_key not in self.client_pool:
             self.client_pool[api_key] = genai.Client(api_key=api_key)
         return self.client_pool[api_key]
+
+    @classmethod
+    def list_available_models(cls, api_key: str) -> List[str]:
+        """Queries Gemini API for available text generation models."""
+        if not api_key:
+            return cls.DEFAULT_FALLBACK_MODELS
+        try:
+            client = genai.Client(api_key=api_key)
+            models = []
+            for m in client.models.list():
+                name = m.name.replace("models/", "") if hasattr(m, "name") else str(m)
+                if "gemini" in name.lower() and "vision" not in name.lower():
+                    models.append(name)
+            logger.info(f"Successfully fetched {len(models)} models from Gemini API.")
+            return models if models else cls.DEFAULT_FALLBACK_MODELS
+        except Exception as e:
+            logger.warning(f"Failed to query model list from API ({e}). Using fallback list.")
+            return cls.DEFAULT_FALLBACK_MODELS
 
     async def generate_text_async(
         self,
@@ -47,7 +72,6 @@ class GeminiClient:
                     system_instruction=system_instruction
                 )
 
-                # Execute in thread executor to keep event loop unblocked
                 loop = asyncio.get_running_loop()
                 response = await loop.run_in_executor(
                     None,

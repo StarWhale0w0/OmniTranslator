@@ -43,7 +43,15 @@ class MainWindow(QtWidgets.QMainWindow):
                     return json.load(f)
             except Exception:
                 pass
-        return {"api_keys": [], "current_model": "gemini-2.5-flash", "max_workers": 4}
+        return {
+            "api_keys": [],
+            "translation_model": "gemini-2.5-flash",
+            "glossary_model": "gemini-2.5-flash",
+            "max_workers": 4,
+            "chunk_size": 4000,
+            "request_delay": 0.5,
+            "use_dynamic_glossary": True
+        }
 
     def _init_ui(self):
         main_widget = QtWidgets.QWidget()
@@ -86,6 +94,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.progress_bar = QtWidgets.QProgressBar()
         self.progress_bar.setRange(0, 100)
+        self.progress_bar.setFormat("%p% (%v/%m Chunks)")
+        self.progress_bar.setAlignment(QtCore.Qt.AlignCenter)
         self.status_label = QtWidgets.QLabel("대기 중")
 
         dash_layout.addWidget(self.progress_bar)
@@ -159,6 +169,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if dialog.exec() == QtWidgets.QDialog.Accepted:
             self.config = self._load_config()
             self.orchestrator.key_manager.set_api_keys(self.config.get("api_keys", []))
+            self.orchestrator.key_manager.set_request_delay(self.config.get("request_delay", 0.5))
             self.orchestrator.config = self.config
             logger.info("Settings updated and applied runtime.")
 
@@ -202,8 +213,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cancel_btn.setEnabled(False)
 
     def _on_progress(self, processed: int, total: int, msg: str):
-        pct = int((processed / total) * 100) if total > 0 else 0
-        self.progress_bar.setValue(pct)
+        self.progress_bar.setRange(0, total if total > 0 else 100)
+        self.progress_bar.setValue(processed)
         self.status_label.setText(msg)
 
     def _on_status(self, msg: str):
