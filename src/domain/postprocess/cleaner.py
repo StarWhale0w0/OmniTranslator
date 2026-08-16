@@ -10,11 +10,25 @@ class TextCleaner:
     """Cleans LLM response text using regex patterns and HTML filter rules."""
 
     @classmethod
+    def clean_html_response(cls, text: str) -> str:
+        """Ported directly from seamarine: strips markdown codeblocks."""
+        if not text:
+            return ""
+        cleaned = text.strip()
+        if cleaned.startswith("```html"):
+            cleaned = cleaned[7:].strip()
+        elif cleaned.startswith("```"):
+            cleaned = cleaned[3:].strip()
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3].strip()
+        return cleaned
+
+    @classmethod
     def clean_text(cls, text: str, extra_patterns: List[str] = None) -> str:
         if not text:
             return ""
 
-        cleaned = text.strip()
+        cleaned = cls.clean_html_response(text)
 
         # 1. Remove <thinking>...</thinking> process blocks
         cleaned = re.sub(r'<thinking>[\s\S]*?</thinking>', '', cleaned, flags=re.IGNORECASE)

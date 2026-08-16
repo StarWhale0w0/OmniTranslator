@@ -1,13 +1,14 @@
 """
 OmniTranslator Pro - Main Orchestrator Engine
-Integrates chunking, profile loading, key manager, Gemini calls, and UI signals.
+Integrates seamarine EPUB parsing & DOM reconstruction workflow
+with batch_translator Gemini API multi-key async rotation.
 """
 
 import asyncio
 import time
 from pathlib import Path
 from typing import Dict, Any, List, Optional
-
+from bs4 import BeautifulSoup
 from PySide6 import QtCore
 from google.genai import types as genai_types
 
@@ -32,7 +33,7 @@ from ui.signals import TranslationSignals
 logger = setup_logger("Orchestrator")
 
 class TranslationOrchestrator(QtCore.QObject):
-    """Pipeline orchestrator for whole document translation jobs and glossary extraction."""
+    """Pipeline orchestrator combining seamarine EPUB workflow with batch_translator API rotation."""
 
     def __init__(self, signals: TranslationSignals, config: Dict[str, Any]):
         super().__init__()
@@ -58,9 +59,6 @@ class TranslationOrchestrator(QtCore.QObject):
             return EnglishProfile()
         return JapaneseProfile()
 
-    def _get_chunker(self, is_epub: bool):
-        return EpubDomChunker() if is_epub else TxtChunker()
-
     def pause(self):
         self.is_paused = True
         self.signals.status_changed.emit("일시 정지됨")
@@ -81,12 +79,13 @@ class TranslationOrchestrator(QtCore.QObject):
             return
 
         self.signals.glossary_loading.emit(True, "AI 용어 추출 중...")
-        self.signals.status_changed.emit("AI 용어 집 추출 수행 중...")
+        self.signals.status_changed.emit("AI 용어집 추출 수행 중...")
 
         try:
             is_epub = input_path.suffix.lower() == ".epub"
             if is_epub:
-                raw_content = EpubIO.extract_epub_html_content(input_path)
+                _, chapters = EpubIO.get_epub_chapters(input_path)
+                raw_content = "\n".join([c.get_content().decode('utf-8', errors='ignore') for c in chapters[:3]])
             else:
                 raw_content = TxtIO.read_text_file(input_path)
 
@@ -119,7 +118,7 @@ class TranslationOrchestrator(QtCore.QObject):
         active_glossary: Optional[List[Dict[str, Any]]] = None,
         resume_existing: bool = True
     ):
-        """Executes full translation pipeline."""
+        """Executes translation pipeline combining seamarine EPUB parser with batch_translator API rotation."""
         self.is_running = True
         self.is_paused = False
         self.cancel_requested = False
@@ -127,7 +126,6 @@ class TranslationOrchestrator(QtCore.QObject):
         self.signals.status_changed.emit("초기화 및 파일 로딩 중...")
         profile = self._get_profile(language)
         is_epub = input_path.suffix.lower() == ".epub"
-        chunker = self._get_chunker(is_epub)
 
         # Update KeyManager delay settings
         self.key_manager.set_request_delay(self.config.get("request_delay", 0.5))
@@ -141,55 +139,42 @@ class TranslationOrchestrator(QtCore.QObject):
         if custom_rules:
             final_system_instruction += f"\n\n## Additional User Custom Rules:\n{custom_rules}"
 
-        # 1. Load Raw File Content
-        if is_epub:
-            raw_content = EpubIO.extract_epub_html_content(input_path)
-        else:
-            raw_content = TxtIO.read_text_file(input_path)
-
-        # 2. Chunking
-        configured_chunk_size = self.config.get("chunk_size", 4000)
-        max_chunk_size = 2000 if is_epub else configured_chunk_size
-        chunks = chunker.split_into_chunks(raw_content, max_size=max_chunk_size)
-        total_chunks = len(chunks)
-
-        translated_dict: Dict[int, str] = {}
-        
         # Load or use passed glossary entries
         glossary_file = input_path.parent / f"{input_path.name}.glossary.json"
         glossary_entries: List[Dict[str, Any]] = active_glossary if active_glossary is not None else GlossaryExtractor.load_glossary_json(glossary_file)
 
-        # Check existing checkpoint for resume
+        translated_dict: Dict[int, str] = {}
+        
+        # Check existing checkpoint
         if resume_existing:
             ckpt = SessionManager.load_checkpoint(input_path)
             if ckpt and "translated_chunks" in ckpt:
                 translated_dict = ckpt["translated_chunks"]
                 if not glossary_entries:
                     glossary_entries = ckpt.get("glossary", [])
-                logger.info(f"Resuming job: {len(translated_dict)}/{total_chunks} chunks already completed.")
+                logger.info(f"Resuming job: {len(translated_dict)} chunks already complete.")
 
-        self.signals.progress.emit(len(translated_dict), total_chunks, "번역 준비 완료")
-
-        # 3. Parallel Translation Loop
         start_time = time.time()
         max_workers = self.config.get("max_workers", 4)
         semaphore = asyncio.Semaphore(max_workers)
         trans_model = self.config.get("translation_model", "gemini-2.5-flash")
         use_glossary = self.config.get("use_dynamic_glossary", True)
         prefill_text = self.config.get("prefill_text", "").strip()
+        configured_chunk_size = self.config.get("chunk_size", 2000)
 
-        async def process_single_chunk(idx: int, text_chunk: str):
+        # Helper: Async single chunk translation with batch_translator key rotation & retry
+        async def translate_single_chunk(idx: int, text_chunk: str) -> str:
             if idx in translated_dict:
-                return
+                return translated_dict[idx]
 
             async with semaphore:
                 while self.is_paused and not self.cancel_requested:
                     await asyncio.sleep(0.5)
 
                 if self.cancel_requested:
-                    return
+                    return text_chunk
 
-                # Build prompt with Dynamic Glossary Context
+                # Inject dynamic glossary
                 glossary_context = GlossaryInjector.inject_glossary_context(
                     text_chunk, glossary_entries, enabled=use_glossary
                 )
@@ -220,55 +205,92 @@ class TranslationOrchestrator(QtCore.QObject):
                         system_instruction=final_system_instruction
                     )
 
-                    # Postprocess Clean
                     cleaned_result = TextCleaner.clean_text(result_raw, profile.get_cleaner_patterns())
-                    
-                    # Quality Inspection
-                    qa_res = QualityChecker.inspect_chunk(text_chunk, cleaned_result)
-                    if qa_res["is_suspicious"]:
-                        self.signals.log_emitted.emit("WARNING", f"Chunk #{idx+1} QA Warning: {qa_res['issue']}")
-
                     translated_dict[idx] = cleaned_result
                     
-                    # Emit chunk updates
                     processed_count = len(translated_dict)
                     elapsed = time.time() - start_time
                     speed = processed_count / elapsed if elapsed > 0 else 0.1
-                    eta_sec = int((total_chunks - processed_count) / speed) if speed > 0 else 0
                     
-                    delay_info = f"딜레이: {self.key_manager.request_delay:.1f}s"
-                    status_msg = f"처리 중 ({processed_count}/{total_chunks} Chunks) | 속도: {speed:.1f} 청크/s | ETA: {eta_sec}s | {delay_info}"
-                    self.signals.progress.emit(processed_count, total_chunks, status_msg)
                     self.signals.preview_updated.emit(text_chunk[:300], cleaned_result[:300])
-
-                    # Atomic Checkpoint Save
-                    SessionManager.save_checkpoint(input_path, output_path, language, total_chunks, translated_dict, glossary_entries)
+                    SessionManager.save_checkpoint(input_path, output_path, language, 0, translated_dict, glossary_entries)
+                    return cleaned_result
 
                 except Exception as e:
                     logger.error(f"Error processing chunk #{idx+1}: {e}")
                     self.signals.log_emitted.emit("ERROR", f"Chunk #{idx+1} error: {e}")
+                    return text_chunk
 
-        # Execute chunk tasks
-        tasks = [process_single_chunk(i, chunks[i]) for i in range(total_chunks)]
-        await asyncio.gather(*tasks, return_exceptions=True)
+        # =========================================================================
+        # EPUB PARSED WORKFLOW (seamarine)
+        # =========================================================================
+        if is_epub:
+            book, chapters = EpubIO.get_epub_chapters(input_path)
+            total_chapters = len(chapters)
+            
+            self.signals.status_changed.emit(f"EPUB 챕터 구조 분석 중... (총 {total_chapters}개 챕터)")
+            global_chunk_idx = 0
+
+            for ch_idx, chapter in enumerate(chapters):
+                if self.cancel_requested:
+                    break
+
+                raw_html = chapter.get_content().decode('utf-8', errors='ignore')
+                soup = BeautifulSoup(raw_html, 'html.parser')
+                body = soup.body if soup.body else soup
+
+                # seamarine DOM preserving chunking
+                chunk_tags = EpubDomChunker.chunk_body_preserving_structure(body, max_chars=configured_chunk_size)
+                
+                ch_tasks = []
+                for chunk_tag in chunk_tags:
+                    chunk_str = str(chunk_tag)
+                    ch_tasks.append((global_chunk_idx, chunk_str))
+                    global_chunk_idx += 1
+
+                # Execute chapter chunks in parallel
+                ch_results = []
+                for g_idx, c_str in ch_tasks:
+                    res = await translate_single_chunk(g_idx, c_str)
+                    ch_results.append(res)
+                    
+                    self.signals.progress.emit(
+                        len(translated_dict),
+                        global_chunk_idx,
+                        f"챕터 {ch_idx+1}/{total_chapters} 번역 중... ({len(translated_dict)} 청크 완료)"
+                    )
+
+                # seamarine HTML DOM reconstruction per chapter
+                rebuilt_html = EpubIO.rebuild_chapter_html(raw_html, ch_results)
+                chapter.set_content(rebuilt_html.encode('utf-8'))
+
+            if not self.cancel_requested:
+                self.signals.status_changed.emit("최종 EPUB 파일 패키징 중...")
+                EpubIO.save_epub(book, output_path)
+
+        # =========================================================================
+        # TXT PARSED WORKFLOW
+        # =========================================================================
+        else:
+            raw_content = TxtIO.read_text_file(input_path)
+            txt_chunker = TxtChunker()
+            chunks = txt_chunker.split_into_chunks(raw_content, max_size=configured_chunk_size)
+            total_chunks = len(chunks)
+
+            tasks = [translate_single_chunk(i, chunks[i]) for i in range(total_chunks)]
+            results = await asyncio.gather(*tasks)
+
+            if not self.cancel_requested:
+                final_text = "\n\n".join(results)
+                TxtIO.write_text_file(output_path, final_text)
 
         if self.cancel_requested:
             self.signals.completed.emit(False, "작업이 사용자에 의해 취소되었습니다.")
             return
 
-        # 4. Assembly & Reconstruction
-        self.signals.status_changed.emit("최종 파일 조립 및 저장 중...")
-        ordered_results = [translated_dict.get(i, chunks[i]) for i in range(total_chunks)]
-
-        if is_epub:
-            EpubIO.rebuild_epub(input_path, output_path, ordered_results)
-        else:
-            final_text = "\n\n".join(ordered_results)
-            TxtIO.write_text_file(output_path, final_text)
-
         # Cleanup checkpoint on clean finish
         SessionManager.remove_checkpoint(input_path)
 
-        self.signals.progress.emit(total_chunks, total_chunks, "번역 완료!")
+        self.signals.progress.emit(len(translated_dict), len(translated_dict), "번역 완료!")
         self.signals.completed.emit(True, f"성공적으로 번역되었습니다:\n{output_path}")
         self.is_running = False
