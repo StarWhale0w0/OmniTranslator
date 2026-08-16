@@ -10,6 +10,7 @@ from PySide6 import QtWidgets, QtCore
 from common.paths import get_app_data_path
 from common.config_loader import ConfigLoader
 from common.logger import setup_logger
+from domain.glossary.extractor import GlossaryExtractor
 from ui.signals import TranslationSignals
 from ui.settings_dialog import SettingsDialog
 from ui.widgets.language_toggle import LanguageToggleWidget
@@ -140,6 +141,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.signals.log_emitted.connect(self.log_console.append_log)
         self.signals.preview_updated.connect(self.preview_panel.update_preview)
         self.signals.completed.connect(self._on_completed)
+        self.signals.glossary_extracted.connect(self.glossary_table.set_entries)
+        self.signals.glossary_loading.connect(self.glossary_table.set_loading)
+        self.glossary_table.extract_requested.connect(self._trigger_glossary_extraction)
 
     def _browse_file(self):
         file_path, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -151,6 +155,20 @@ class MainWindow(QtWidgets.QMainWindow):
             out_p = p.parent / f"{p.stem}_translated{p.suffix}"
             self.output_edit.setText(str(out_p))
 
+            # 1. Clear previous glossary entries immediately to isolate per-file
+            self.glossary_table.clear_entries()
+
+            # 2. Check for per-file glossary json (e.g. A_novel.epub.glossary.json)
+            glossary_file = p.parent / f"{p.name}.glossary.json"
+            if glossary_file.exists():
+                entries = GlossaryExtractor.load_glossary_json(glossary_file)
+                self.glossary_table.set_entries(entries)
+                logger.info(f"Loaded isolated glossary ({len(entries)} items) for {p.name}")
+                self.status_label.setText(f"작품 용어집 로드됨 ({len(entries)}개 용어)")
+            else:
+                self.status_label.setText("작품 용어집 없음. [📖 용어집 관리] 탭에서 [🔍 AI 용어집 추출]을 눌러 생성할 수 있습니다.")
+
+            # Check checkpoint
             ckpt = SessionManager.load_checkpoint(p)
             if ckpt:
                 done_cnt = len(ckpt.get("translated_chunks", {}))
@@ -163,9 +181,29 @@ class MainWindow(QtWidgets.QMainWindow):
                 if res == QtWidgets.QMessageBox.No:
                     SessionManager.remove_checkpoint(p)
 
+    def _trigger_glossary_extraction(self):
+        in_path = self.input_edit.text().strip()
+        if not in_path or not Path(in_path).exists():
+            QtWidgets.QMessageBox.warning(self, "경고", "용어를 추출할 입력 파일을 먼저 선택해주세요.")
+            return
+
+        if not self.config.get("api_keys"):
+            QtWidgets.QMessageBox.warning(self, "경고", "용어 추출을 위해 설정 메뉴에서 API 키를 먼저 등록해주세요.")
+            self._open_settings()
+            return
+
+        lang = self.lang_toggle.get_selected_language()
+        self.tabs.setCurrentIndex(1)  # Switch to Glossary Tab
+
+        if self.loop:
+            asyncio.run_coroutine_threadsafe(
+                self.orchestrator.extract_glossary_async(Path(in_path), lang),
+                self.loop
+            )
+
     def _open_settings(self):
         dialog = SettingsDialog(self)
-        dialog.load_settings()  # Explicitly load fresh configuration onto UI controls
+        dialog.load_settings()
         if dialog.exec() == QtWidgets.QDialog.Accepted:
             self.config = ConfigLoader.load_or_init_config()
             self.orchestrator.key_manager.set_api_keys(self.config.get("api_keys", []))
@@ -186,6 +224,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self._open_settings()
             return
 
+        # Save current glossary UI table state to per-file json
+        p_in = Path(in_path)
+        glossary_entries = self.glossary_table.get_entries()
+        if glossary_entries:
+            glossary_file = p_in.parent / f"{p_in.name}.glossary.json"
+            GlossaryExtractor.save_glossary_json(glossary_entries, glossary_file)
+
         self.start_btn.setEnabled(False)
         self.pause_btn.setEnabled(True)
         self.cancel_btn.setEnabled(True)
@@ -194,7 +239,12 @@ class MainWindow(QtWidgets.QMainWindow):
         
         if self.loop:
             asyncio.run_coroutine_threadsafe(
-                self.orchestrator.run_pipeline_async(Path(in_path), Path(out_path), lang),
+                self.orchestrator.run_pipeline_async(
+                    input_path=p_in,
+                    output_path=Path(out_path),
+                    language=lang,
+                    active_glossary=glossary_entries
+                ),
                 self.loop
             )
 

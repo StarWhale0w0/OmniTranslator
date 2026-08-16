@@ -11,3 +11,5 @@ class TranslationSignals(QtCore.QObject):
     log_emitted = QtCore.Signal(str, str)             # level (INFO/WARNING/ERROR), text
     preview_updated = QtCore.Signal(str, str)         # raw_snippet, trans_snippet
     completed = QtCore.Signal(bool, str)              # success, message/error_details
+    glossary_extracted = QtCore.Signal(list)          # extracted entries list
+    glossary_loading = QtCore.Signal(bool, str)       # is_loading, message

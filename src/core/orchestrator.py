@@ -23,6 +23,7 @@ from domain.profiles.zh_profile import ChineseProfile
 from domain.profiles.en_profile import EnglishProfile
 from domain.chunkers.epub_dom_chunker import EpubDomChunker
 from domain.chunkers.txt_chunker import TxtChunker
+from domain.glossary.extractor import GlossaryExtractor
 from domain.glossary.injector import GlossaryInjector
 from domain.postprocess.cleaner import TextCleaner
 from domain.postprocess.quality_checker import QualityChecker
@@ -31,7 +32,7 @@ from ui.signals import TranslationSignals
 logger = setup_logger("Orchestrator")
 
 class TranslationOrchestrator(QtCore.QObject):
-    """Pipeline orchestrator for whole document translation jobs."""
+    """Pipeline orchestrator for whole document translation jobs and glossary extraction."""
 
     def __init__(self, signals: TranslationSignals, config: Dict[str, Any]):
         super().__init__()
@@ -73,11 +74,49 @@ class TranslationOrchestrator(QtCore.QObject):
         self.is_running = False
         self.signals.status_changed.emit("작업 취소 요청됨...")
 
+    async def extract_glossary_async(self, input_path: Path, language: str):
+        """Extracts AI glossary from document text asynchronously."""
+        if not input_path.exists():
+            self.signals.log_emitted.emit("ERROR", "용어 추출 실패: 입력 파일이 존재하지 않습니다.")
+            return
+
+        self.signals.glossary_loading.emit(True, "AI 용어 추출 중...")
+        self.signals.status_changed.emit("AI 용어 집 추출 수행 중...")
+
+        try:
+            is_epub = input_path.suffix.lower() == ".epub"
+            if is_epub:
+                raw_content = EpubIO.extract_epub_html_content(input_path)
+            else:
+                raw_content = TxtIO.read_text_file(input_path)
+
+            gloss_model = self.config.get("glossary_model", "gemini-2.5-flash")
+            entries = await GlossaryExtractor.extract_glossary_async(
+                gemini_client=self.gemini_client,
+                text_content=raw_content,
+                lang_code=language,
+                model_name=gloss_model
+            )
+
+            glossary_file = input_path.parent / f"{input_path.name}.glossary.json"
+            GlossaryExtractor.save_glossary_json(entries, glossary_file)
+
+            self.signals.glossary_extracted.emit(entries)
+            self.signals.glossary_loading.emit(False, f"용어 {len(entries)}개 추출 완료!")
+            self.signals.status_changed.emit("용어집 추출 완료!")
+            self.signals.log_emitted.emit("INFO", f"AI 용어 추출 완료: {len(entries)}개 용어 저장됨 ({glossary_file.name})")
+
+        except Exception as e:
+            logger.error(f"Glossary extraction pipeline failed: {e}")
+            self.signals.glossary_loading.emit(False, f"추출 실패: {e}")
+            self.signals.log_emitted.emit("ERROR", f"용어 추출 중 오류 발생: {e}")
+
     async def run_pipeline_async(
         self,
         input_path: Path,
         output_path: Path,
         language: str,
+        active_glossary: Optional[List[Dict[str, Any]]] = None,
         resume_existing: bool = True
     ):
         """Executes full translation pipeline."""
@@ -115,14 +154,18 @@ class TranslationOrchestrator(QtCore.QObject):
         total_chunks = len(chunks)
 
         translated_dict: Dict[int, str] = {}
-        glossary_entries: List[Dict[str, Any]] = []
+        
+        # Load or use passed glossary entries
+        glossary_file = input_path.parent / f"{input_path.name}.glossary.json"
+        glossary_entries: List[Dict[str, Any]] = active_glossary if active_glossary is not None else GlossaryExtractor.load_glossary_json(glossary_file)
 
         # Check existing checkpoint for resume
         if resume_existing:
             ckpt = SessionManager.load_checkpoint(input_path)
             if ckpt and "translated_chunks" in ckpt:
                 translated_dict = ckpt["translated_chunks"]
-                glossary_entries = ckpt.get("glossary", [])
+                if not glossary_entries:
+                    glossary_entries = ckpt.get("glossary", [])
                 logger.info(f"Resuming job: {len(translated_dict)}/{total_chunks} chunks already completed.")
 
         self.signals.progress.emit(len(translated_dict), total_chunks, "번역 준비 완료")
@@ -137,7 +180,7 @@ class TranslationOrchestrator(QtCore.QObject):
 
         async def process_single_chunk(idx: int, text_chunk: str):
             if idx in translated_dict:
-                return  # Skip already translated chunk
+                return
 
             async with semaphore:
                 while self.is_paused and not self.cancel_requested:
