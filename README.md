@@ -1,9 +1,10 @@
- 🚀 OmniTranslator Pro v1.0.0
+ ### 🚀 OmniTranslator Pro v1.0.0
 
   OmniTranslator Pro는 Google Gemini AI 기반의 장편 소설(Light Novel / Web Novel) 및 전자책 전문 고성능 배치 번역
   데스크톱 애플리케이션입니다.
   EPUB과 TXT 문서를 완벽 지원하며, 다중 API 키 로테이션과 지능형 용어집 시스템으로 빠르고 일관성 있는 고품질 번역을
   제공합니다.
+  
   ──────
   ## 🌟 주요 핵심 기능 (Key Features)
   ### 1. 📚 전자책(EPUB) 및 텍스트(TXT) 포맷 맞춤형 번역
