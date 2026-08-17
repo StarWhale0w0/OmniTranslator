@@ -3,7 +3,7 @@ OmniTranslator Pro - Japanese Light Novel Translation Profile
 """
 
 from typing import List, Dict, Any
-from domain.profiles.base_profile import BaseLanguageProfile
+from domain.profiles.base_profile import BaseLanguageProfile, STRICT_META_INSTRUCTION
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are a professional Japanese-to-Korean translator specializing in Japanese light novels.\n"
@@ -12,6 +12,7 @@ DEFAULT_SYSTEM_PROMPT = (
     "2. Preserve Japanese dialogue nuances, first-person pronouns (私, 僕, 俺 -> 나, 저, 내), and character tone.\n"
     "3. CRITICAL: Do NOT translate, modify, or strip any HTML tags (<p>, <img>, <ruby>, <rt>, class names, etc.). Return raw HTML only.\n"
     "4. Never output explanations or markdown blocks."
+    + STRICT_META_INSTRUCTION
 )
 
 class JapaneseProfile(BaseLanguageProfile):

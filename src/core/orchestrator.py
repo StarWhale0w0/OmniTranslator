@@ -139,6 +139,14 @@ class TranslationOrchestrator(QtCore.QObject):
         if custom_rules:
             final_system_instruction += f"\n\n## Additional User Custom Rules:\n{custom_rules}"
 
+        strict_meta_rule = (
+            "\n\n[출력 절대 규칙]\n"
+            "절대로 번역 과정, 검토 메모, 체크리스트, 'Final check' 등의 메타 텍스트를 출력하지 마십시오. "
+            "오직 최종 번역된 본문 HTML/텍스트만을 출력하십시오."
+        )
+        if "절대로 번역 과정" not in final_system_instruction:
+            final_system_instruction += strict_meta_rule
+
         # Load or use passed glossary entries
         glossary_file = input_path.parent / f"{input_path.name}.glossary.json"
         glossary_entries: List[Dict[str, Any]] = active_glossary if active_glossary is not None else GlossaryExtractor.load_glossary_json(glossary_file)
@@ -197,15 +205,52 @@ class TranslationOrchestrator(QtCore.QObject):
                 )
 
                 try:
+                    init_temp = self.config.get("temperature", 0.3)
                     result_raw = await self.gemini_client.generate_text_async(
                         prompt_contents=prompt_contents,
                         model_name=trans_model,
-                        temperature=self.config.get("temperature", 0.7),
+                        temperature=init_temp,
                         top_p=self.config.get("top_p", 0.9),
+                        thinking_budget=0,
                         system_instruction=final_system_instruction
                     )
 
                     cleaned_result = TextCleaner.clean_text(result_raw, profile.get_cleaner_patterns())
+                    qc_result = QualityChecker.inspect_chunk(text_chunk, cleaned_result)
+
+                    # Repetition or severe quality failure: Auto-retry with lowered temperature (0.1)
+                    if qc_result["is_suspicious"]:
+                        logger.warning(
+                            f"Chunk #{idx+1} quality check issue ({qc_result['issue']}). "
+                            f"Retrying with lower temperature (0.1)..."
+                        )
+                        self.signals.log_emitted.emit(
+                            "WARNING",
+                            f"Chunk #{idx+1} 품질 불량 ({qc_result['issue']}) -> 온도 0.1로 자동 재요청(Retry) 중..."
+                        )
+
+                        retry_raw = await self.gemini_client.generate_text_async(
+                            prompt_contents=prompt_contents,
+                            model_name=trans_model,
+                            temperature=0.1,
+                            top_p=self.config.get("top_p", 0.9),
+                            thinking_budget=0,
+                            system_instruction=final_system_instruction
+                        )
+                        retry_cleaned = TextCleaner.clean_text(retry_raw, profile.get_cleaner_patterns())
+                        retry_qc = QualityChecker.inspect_chunk(text_chunk, retry_cleaned)
+
+                        if not retry_qc["is_suspicious"]:
+                            cleaned_result = retry_cleaned
+                            logger.info(f"Chunk #{idx+1} quality restored successfully on retry.")
+                            self.signals.log_emitted.emit("INFO", f"Chunk #{idx+1} 재시도로 품질 정상 복구 완료.")
+                        else:
+                            if retry_qc.get("is_repetition"):
+                                cleaned_result = TextCleaner.deduplicate_repetitions(retry_cleaned)
+                                logger.info(f"Chunk #{idx+1} repetition deduplication fallback applied.")
+                            else:
+                                cleaned_result = retry_cleaned
+
                     translated_dict[idx] = cleaned_result
                     
                     processed_count = len(translated_dict)

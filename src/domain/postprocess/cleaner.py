@@ -24,21 +24,59 @@ class TextCleaner:
         return cleaned
 
     @classmethod
+    def deduplicate_repetitions(cls, text: str, max_consecutive: int = 1) -> str:
+        """Removes runaway consecutive duplicate lines/paragraphs caused by repetition hallucinations."""
+        if not text:
+            return ""
+        lines = text.splitlines()
+        deduped_lines = []
+        repeat_count = 0
+        prev_line = None
+
+        for line in lines:
+            trimmed = line.strip()
+            if trimmed and trimmed == prev_line:
+                repeat_count += 1
+                if repeat_count < max_consecutive:
+                    deduped_lines.append(line)
+            else:
+                repeat_count = 0
+                prev_line = trimmed
+                deduped_lines.append(line)
+
+        return "\n".join(deduped_lines)
+
+    @classmethod
     def clean_text(cls, text: str, extra_patterns: List[str] = None) -> str:
         if not text:
             return ""
 
         cleaned = cls.clean_html_response(text)
 
-        # 1. Remove <thinking>...</thinking> process blocks
-        cleaned = re.sub(r'<thinking>[\s\S]*?</thinking>', '', cleaned, flags=re.IGNORECASE)
+        # 1. Remove <think>...</think>, <thought>...</thought>, <thinking>...</thinking>, <reflection>...</reflection> blocks
+        cleaned = re.sub(r'<(?:think|thought|thinking|reflection)>[\s\S]*?</(?:think|thought|thinking|reflection)>', '', cleaned, flags=re.IGNORECASE)
 
-        # 2. Remove language-specific regex patterns (ads, headers)
+        # 2. Remove '*+ *Final check on.*?(\n|$)' and similar asterisk/bracket header lines
+        cleaned = re.sub(r'\*+\s*Final check.*?(?:\n|$)', '\n', cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r'\[Final check.*?(?:\]|\n|$)', '\n', cleaned, flags=re.IGNORECASE)
+
+        # 3. Remove Markdown checklist logs (- [x] ..., * [ ] ...)
+        cleaned = re.sub(r'^\s*[-*+]\s*\[[ xX]\]\s*.*$(?:\n)?', '', cleaned, flags=re.MULTILINE)
+
+        # 4. Remove verification traces like -> `...` (Correct|Fixed)
+        cleaned = re.sub(r'^[^\n<]*->\s*`?[^`\n]+`?\s*\((?:Correct|Fixed|Pass|OK)\)[^\n]*$(?:\n)?', '', cleaned, flags=re.MULTILINE | re.IGNORECASE)
+        cleaned = re.sub(r'->\s*`?[^`\n]+`?\s*\((?:Correct|Fixed|Pass|OK)\)', '', cleaned, flags=re.IGNORECASE)
+
+        # 5. Remove bracket/asterisk verification phrases (e.g., [검토 메모], *검토 완료*, *Self-Correction*)
+        cleaned = re.sub(r'^\s*\[(?:Final check|검토|자가검증|자체\s*검토|체크리스트|Checklist|Review|Self-Correction).*?\]\s*$(?:\n)?', '', cleaned, flags=re.MULTILINE | re.IGNORECASE)
+        cleaned = re.sub(r'^\s*\*+\s*(?:Final check|검토|체크리스트|Checklist|Self-Correction|Self-check|Verification).*?\*+\s*$(?:\n)?', '', cleaned, flags=re.MULTILINE | re.IGNORECASE)
+
+        # 6. Remove language-specific regex patterns (ads, headers)
         if extra_patterns:
             for pattern in extra_patterns:
                 cleaned = re.sub(pattern, '', cleaned, flags=re.MULTILINE | re.IGNORECASE)
 
-        # 3. Clean consecutive empty newlines
+        # 7. Clean consecutive empty newlines
         cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
 
         return cleaned.strip()

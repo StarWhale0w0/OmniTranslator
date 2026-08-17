@@ -25,6 +25,12 @@ logger = setup_logger("MainWindow")
 class MainWindow(QtWidgets.QMainWindow):
     """OmniTranslator Pro Main Dashboard Window."""
 
+    LANG_BADGES = {
+        "JA": "🇯🇵 일본어 (JA)",
+        "ZH": "🇨🇳 중국어 (ZH)",
+        "EN": "🇺🇸 영어 (EN)"
+    }
+
     def __init__(self, loop=None, parent=None):
         super().__init__(parent)
         self.loop = loop
@@ -37,6 +43,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._init_ui()
         self._wire_signals()
         
+        # Initialize title badge with configured default language
+        default_lang = self.config.get("default_language", "JA")
+        self.lang_toggle.set_selected_language(default_lang)
+        self._update_title_badge(default_lang)
+
         # Check API Keys on startup
         QtCore.QTimer.singleShot(500, self._check_initial_api_keys)
 
@@ -53,6 +64,14 @@ class MainWindow(QtWidgets.QMainWindow):
             if res == QtWidgets.QMessageBox.Yes:
                 self._open_settings()
 
+    def _update_title_badge(self, lang_code: str):
+        """Updates the header title label in real-time with country/language badge and accent color."""
+        badge = self.LANG_BADGES.get(lang_code.upper(), f"🌐 {lang_code}")
+        self.app_title.setText(
+            f"<span style='color: #8E75FF;'>OmniTranslator Pro</span>&nbsp;&nbsp;"
+            f"<span style='color: #38BDF8; font-size: 15px; font-weight: bold;'>[{badge}]</span>"
+        )
+
     def _init_ui(self):
         main_widget = QtWidgets.QWidget()
         self.setCentralWidget(main_widget)
@@ -60,14 +79,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # 1. Header Row
         header = QtWidgets.QHBoxLayout()
-        app_title = QtWidgets.QLabel("OmniTranslator Pro")
-        app_title.setStyleSheet("font-size: 20px; font-weight: bold; color: #8E75FF;")
+        self.app_title = QtWidgets.QLabel("OmniTranslator Pro")
+        self.app_title.setStyleSheet("font-size: 20px; font-weight: bold;")
         
         self.lang_toggle = LanguageToggleWidget()
         settings_btn = QtWidgets.QPushButton("⚙️ 설정")
         settings_btn.clicked.connect(self._open_settings)
 
-        header.addWidget(app_title)
+        header.addWidget(self.app_title)
         header.addStretch()
         header.addWidget(self.lang_toggle)
         header.addWidget(settings_btn)
@@ -144,6 +163,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.signals.glossary_extracted.connect(self.glossary_table.set_entries)
         self.signals.glossary_loading.connect(self.glossary_table.set_loading)
         self.glossary_table.extract_requested.connect(self._trigger_glossary_extraction)
+        self.lang_toggle.language_changed.connect(self._update_title_badge)
 
     def _browse_file(self):
         file_path, _ = QtWidgets.QFileDialog.getOpenFileName(

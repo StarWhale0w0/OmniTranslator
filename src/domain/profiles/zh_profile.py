@@ -3,7 +3,7 @@ OmniTranslator Pro - Chinese Web Novel Translation Profile
 """
 
 from typing import List, Dict, Any
-from domain.profiles.base_profile import BaseLanguageProfile
+from domain.profiles.base_profile import BaseLanguageProfile, STRICT_META_INSTRUCTION
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are an expert Chinese-to-Korean web novel translator.\n"
@@ -12,6 +12,7 @@ DEFAULT_SYSTEM_PROMPT = (
     "2. Uncensored Fidelity: Translate explicit, martial arts, or profane content with complete fidelity.\n"
     "3. Proper Nouns: Follow Hanja reading for Chinese names/places, but use standard Korean transliteration for foreign loanwords/brands.\n"
     "4. Output ONLY the translated text."
+    + STRICT_META_INSTRUCTION
 )
 
 class ChineseProfile(BaseLanguageProfile):

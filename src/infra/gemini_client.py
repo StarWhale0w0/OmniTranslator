@@ -72,10 +72,10 @@ class GeminiClient:
         model_name: str = "gemini-2.5-flash",
         temperature: float = 0.7,
         top_p: float = 0.9,
-        thinking_level: str = "high",
+        thinking_budget: Optional[int] = 0,
         system_instruction: Optional[str] = None
     ) -> str:
-        """Performs async text generation with key rotation retries."""
+        """Performs async text generation with key rotation retries and thinking budget control."""
         max_retries = max(len(self.key_manager.api_keys), 3)
 
         for attempt in range(max_retries):
@@ -84,10 +84,17 @@ class GeminiClient:
 
             try:
                 sdk_client = self._get_sdk_client(api_key)
+                
+                # Configure thinking_budget: 0 to disable model reasoning/self-verification artifacts
+                thinking_config = None
+                if thinking_budget is not None:
+                    thinking_config = genai_types.ThinkingConfig(thinking_budget=thinking_budget)
+
                 config = genai_types.GenerateContentConfig(
                     temperature=temperature,
                     top_p=top_p,
-                    system_instruction=system_instruction
+                    system_instruction=system_instruction,
+                    thinking_config=thinking_config
                 )
 
                 loop = asyncio.get_running_loop()

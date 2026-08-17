@@ -36,3 +36,13 @@ class LanguageToggleWidget(QtWidgets.QWidget):
     def get_selected_language(self) -> str:
         checked = self.btn_group.checkedButton()
         return checked.text().split()[-1] if checked else "JA"
+
+    def set_selected_language(self, lang_code: str):
+        target = lang_code.upper()
+        if target == "ZH":
+            self.zh_btn.setChecked(True)
+        elif target == "EN":
+            self.en_btn.setChecked(True)
+        else:
+            self.ja_btn.setChecked(True)
+        self.language_changed.emit(target)

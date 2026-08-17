@@ -3,7 +3,7 @@ OmniTranslator Pro - English Novel Translation Profile
 """
 
 from typing import List, Dict, Any
-from domain.profiles.base_profile import BaseLanguageProfile
+from domain.profiles.base_profile import BaseLanguageProfile, STRICT_META_INSTRUCTION
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are a professional English-to-Korean literary translator.\n"
@@ -12,6 +12,7 @@ DEFAULT_SYSTEM_PROMPT = (
     "2. Dialogue: Adapt English dialogue into natural, authentic Korean spoken register.\n"
     "3. Foreign Words: Transliterate names and places according to standard Korean loanword orthography.\n"
     "4. Output ONLY the translation."
+    + STRICT_META_INSTRUCTION
 )
 
 class EnglishProfile(BaseLanguageProfile):

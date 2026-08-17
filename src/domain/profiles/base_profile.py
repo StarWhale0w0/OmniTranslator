@@ -5,6 +5,12 @@ OmniTranslator Pro - Base Language Profile
 from abc import ABC, abstractmethod
 from typing import List, Dict, Any
 
+STRICT_META_INSTRUCTION = (
+    "\n\n[출력 절대 규칙]\n"
+    "절대로 번역 과정, 검토 메모, 체크리스트, 'Final check' 등의 메타 텍스트를 출력하지 마십시오. "
+    "오직 최종 번역된 본문 HTML/텍스트만을 출력하십시오."
+)
+
 class BaseLanguageProfile(ABC):
     """Abstract base class defining language-specific prompt engineering & translation rules."""
 
@@ -13,7 +19,7 @@ class BaseLanguageProfile(ABC):
 
     @abstractmethod
     def get_system_instruction(self) -> str:
-        """Returns the system instruction prompt."""
+        """Returns the system instruction prompt with strict meta rules appended."""
         pass
 
     @abstractmethod
