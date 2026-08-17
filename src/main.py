@@ -27,6 +27,11 @@ def main() -> None:
         app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
         app.setStyle("Fusion")
 
+        app_icon_path = get_resource_path("assets/icons/app_icon.png")
+        if app_icon_path and app_icon_path.exists():
+            from PySide6 import QtGui
+            app.setWindowIcon(QtGui.QIcon(str(app_icon_path)))
+
         # 2. Load QSS Stylesheet
         try:
             qss_path = get_resource_path("assets/styles/theme.qss")

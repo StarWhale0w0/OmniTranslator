@@ -18,17 +18,17 @@ class BaseLanguageProfile(ABC):
         self.lang_code = lang_code.upper()
 
     @abstractmethod
-    def get_system_instruction(self) -> str:
+    def get_system_instruction(self, is_epub: bool = True) -> str:
         """Returns the system instruction prompt with strict meta rules appended."""
         pass
 
     @abstractmethod
-    def get_prefill_history(self) -> List[Dict[str, Any]]:
+    def get_prefill_history(self, is_epub: bool = True) -> List[Dict[str, Any]]:
         """Returns prefill conversation history for censorship bypass / persona anchoring."""
         pass
 
     @abstractmethod
-    def get_prompt_template(self) -> str:
+    def get_prompt_template(self, is_epub: bool = True) -> str:
         """Returns prompt template containing {{slot}} and {{glossary_context}} placeholders."""
         pass
 

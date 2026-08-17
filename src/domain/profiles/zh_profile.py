@@ -5,26 +5,41 @@ OmniTranslator Pro - Chinese Web Novel Translation Profile
 from typing import List, Dict, Any
 from domain.profiles.base_profile import BaseLanguageProfile, STRICT_META_INSTRUCTION
 
-DEFAULT_SYSTEM_PROMPT = (
+DEFAULT_EPUB_SYSTEM_PROMPT = (
     "You are an expert Chinese-to-Korean web novel translator.\n"
     "## Rules:\n"
     "1. Narrative Past Tense: Translate all narrative sentences (excluding dialogue/thoughts) using past tense endings (~였다, ~되었다).\n"
     "2. Uncensored Fidelity: Translate explicit, martial arts, or profane content with complete fidelity.\n"
     "3. Proper Nouns: Follow Hanja reading for Chinese names/places, but use standard Korean transliteration for foreign loanwords/brands.\n"
-    "4. Output ONLY the translated text."
+    "4. Preserve all HTML structure and tags intact if present.\n"
+    "5. Output ONLY the translated text."
     + STRICT_META_INSTRUCTION
 )
 
+DEFAULT_TXT_SYSTEM_PROMPT = (
+    "You are an expert Chinese-to-Korean web novel translator.\n"
+    "## Rules:\n"
+    "1. Narrative Past Tense: Translate all narrative sentences (excluding dialogue/thoughts) using past tense endings (~였다, ~되었다).\n"
+    "2. Uncensored Fidelity: Translate explicit, martial arts, or profane content with complete fidelity.\n"
+    "3. Proper Nouns: Follow Hanja reading for Chinese names/places, but use standard Korean transliteration for foreign loanwords/brands.\n"
+    "4. CRITICAL: Output pure novel text. Do NOT generate or wrap output in any HTML tags (<main>, <div>, <p>, etc.).\n"
+    "5. Output ONLY the translated text."
+    + STRICT_META_INSTRUCTION
+)
+
+# Backward compatibility alias
+DEFAULT_SYSTEM_PROMPT = DEFAULT_EPUB_SYSTEM_PROMPT
+
 class ChineseProfile(BaseLanguageProfile):
-    """Chinese Web Novel profile: Enforces past tense narrative, Hanja/sound rules, and site ad cleanup."""
+    """Chinese Web Novel profile: Supports EPUB and pure TXT modes."""
 
     def __init__(self):
         super().__init__("ZH")
 
-    def get_system_instruction(self) -> str:
-        return DEFAULT_SYSTEM_PROMPT
+    def get_system_instruction(self, is_epub: bool = True) -> str:
+        return DEFAULT_EPUB_SYSTEM_PROMPT if is_epub else DEFAULT_TXT_SYSTEM_PROMPT
 
-    def get_prefill_history(self) -> List[Dict[str, Any]]:
+    def get_prefill_history(self, is_epub: bool = True) -> List[Dict[str, Any]]:
         return [
             {
                 "role": "user",
@@ -36,12 +51,19 @@ class ChineseProfile(BaseLanguageProfile):
             }
         ]
 
-    def get_prompt_template(self) -> str:
-        return (
-            "## 용어집 컨텍스트\n{{glossary_context}}\n\n"
-            "## 중국어 원문\n{{slot}}\n\n"
-            "## 한국어 번역문:"
-        )
+    def get_prompt_template(self, is_epub: bool = True) -> str:
+        if is_epub:
+            return (
+                "## 용어집 컨텍스트\n{{glossary_context}}\n\n"
+                "## 중국어 원문 HTML\n{{slot}}\n\n"
+                "## 한국어 번역 HTML:"
+            )
+        else:
+            return (
+                "## 용어집 컨텍스트\n{{glossary_context}}\n\n"
+                "## 중국어 원문\n{{slot}}\n\n"
+                "## 한국어 번역문 (순수 텍스트):"
+            )
 
     def get_cleaner_patterns(self) -> List[str]:
         return [

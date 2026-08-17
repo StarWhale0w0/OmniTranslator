@@ -73,37 +73,40 @@ class TranslationOrchestrator(QtCore.QObject):
         self.signals.status_changed.emit("작업 취소 요청됨...")
 
     async def extract_glossary_async(self, input_path: Path, language: str):
-        """Extracts AI glossary from document text asynchronously."""
+        """Extracts AI glossary from entire document text asynchronously using Map-Reduce scanner."""
         if not input_path.exists():
             self.signals.log_emitted.emit("ERROR", "용어 추출 실패: 입력 파일이 존재하지 않습니다.")
             return
 
-        self.signals.glossary_loading.emit(True, "AI 용어 추출 중...")
-        self.signals.status_changed.emit("AI 용어집 추출 수행 중...")
+        self.signals.glossary_loading.emit(True, "문서 로드 및 분석 블록 분할 중...")
+        self.signals.status_changed.emit("AI 용어집 전수 추출 준비 중...")
+        self.signals.log_emitted.emit("INFO", f"AI 전수 용어 추출 시작: {input_path.name}")
 
         try:
-            is_epub = input_path.suffix.lower() == ".epub"
-            if is_epub:
-                _, chapters = EpubIO.get_epub_chapters(input_path)
-                raw_content = "\n".join([c.get_content().decode('utf-8', errors='ignore') for c in chapters[:3]])
-            else:
-                raw_content = TxtIO.read_text_file(input_path)
-
             gloss_model = self.config.get("glossary_model", "gemini-2.5-flash")
-            entries = await GlossaryExtractor.extract_glossary_async(
+
+            def on_progress(block_idx: int, total_blocks: int, terms_count: int):
+                msg = f"[용어집 분석 중] 블록 {block_idx} / {total_blocks} 완료 (현재 수집된 고유명사: {terms_count}개)..."
+                self.signals.glossary_loading.emit(True, msg)
+                self.signals.status_changed.emit(msg)
+                self.signals.log_emitted.emit("INFO", msg)
+
+            entries = await GlossaryExtractor.extract_glossary_from_file_async(
                 gemini_client=self.gemini_client,
-                text_content=raw_content,
+                file_path=input_path,
                 lang_code=language,
-                model_name=gloss_model
+                model_name=gloss_model,
+                progress_callback=on_progress
             )
 
             glossary_file = input_path.parent / f"{input_path.name}.glossary.json"
             GlossaryExtractor.save_glossary_json(entries, glossary_file)
 
             self.signals.glossary_extracted.emit(entries)
-            self.signals.glossary_loading.emit(False, f"용어 {len(entries)}개 추출 완료!")
-            self.signals.status_changed.emit("용어집 추출 완료!")
-            self.signals.log_emitted.emit("INFO", f"AI 용어 추출 완료: {len(entries)}개 용어 저장됨 ({glossary_file.name})")
+            success_msg = f"용어 총 {len(entries)}개 전수 추출 완료! ({glossary_file.name})"
+            self.signals.glossary_loading.emit(False, success_msg)
+            self.signals.status_changed.emit(success_msg)
+            self.signals.log_emitted.emit("INFO", f"AI 용어 전수 추출 완료: {len(entries)}개 고유명사 저장됨 ({glossary_file.name})")
 
         except Exception as e:
             logger.error(f"Glossary extraction pipeline failed: {e}")
@@ -132,12 +135,32 @@ class TranslationOrchestrator(QtCore.QObject):
 
         # Retrieve system prompt & custom rules from config
         prompt_cfg = self.config.get("prompts", {}).get(language.upper(), {})
-        base_sys_prompt = prompt_cfg.get("system_prompt", profile.get_system_instruction())
+        base_sys_prompt = prompt_cfg.get("system_prompt", profile.get_system_instruction(is_epub=is_epub))
         custom_rules = prompt_cfg.get("custom_rules", "").strip()
 
         final_system_instruction = base_sys_prompt
         if custom_rules:
             final_system_instruction += f"\n\n## Additional User Custom Rules:\n{custom_rules}"
+
+        # If translating TXT, adjust system instruction to strip HTML mandates and enforce pure text
+        if not is_epub:
+            final_system_instruction = re.sub(
+                r'Do NOT translate, modify, or strip any HTML tags[^\n]*',
+                'Translate into pure plain text without HTML tags.',
+                final_system_instruction,
+                flags=re.IGNORECASE
+            )
+            final_system_instruction = re.sub(
+                r'Return raw HTML only\.?',
+                'Return plain novel text only without HTML tags.',
+                final_system_instruction,
+                flags=re.IGNORECASE
+            )
+            if "HTML 태그를 일절 생성하지 마십시오" not in final_system_instruction and "순수 소설 텍스트" not in final_system_instruction:
+                final_system_instruction += (
+                    "\n\n[TXT 포맷 규칙]\n"
+                    "본 문서는 순수 텍스트(TXT) 문서입니다. 원문에 없던 <main>, <div>, <p>, <span> 등의 HTML 태그를 일절 생성하지 말고 순수 소설 텍스트로만 출력하십시오."
+                )
 
         strict_meta_rule = (
             "\n\n[출력 절대 규칙]\n"
@@ -186,14 +209,17 @@ class TranslationOrchestrator(QtCore.QObject):
                 glossary_context = GlossaryInjector.inject_glossary_context(
                     text_chunk, glossary_entries, enabled=use_glossary
                 )
-                prompt_str = profile.get_prompt_template().replace("{{slot}}", text_chunk).replace("{{glossary_context}}", glossary_context)
+                prompt_template = profile.get_prompt_template(is_epub=is_epub)
+                prompt_str = prompt_template.replace("{{slot}}", text_chunk).replace("{{glossary_context}}", glossary_context)
 
                 # Prepare contents & prefill history
                 prompt_contents: List[genai_types.Content] = []
                 if self.config.get("enable_prefill", True):
-                    history_raw = profile.get_prefill_history()
+                    history_raw = profile.get_prefill_history(is_epub=is_epub)
                     for item in history_raw:
                         p_text = prefill_text if item["role"] == "model" and prefill_text else item["parts"][0]
+                        if not is_epub:
+                            p_text = p_text.replace("raw HTML structure", "plain text structure").replace("preserving all HTML tags", "in pure novel prose without HTML tags")
                         prompt_contents.append(
                             genai_types.Content(
                                 role=item["role"],
@@ -216,6 +242,9 @@ class TranslationOrchestrator(QtCore.QObject):
                     )
 
                     cleaned_result = TextCleaner.clean_text(result_raw, profile.get_cleaner_patterns())
+                    if not is_epub:
+                        cleaned_result = TextCleaner.strip_html_tags(cleaned_result)
+
                     qc_result = QualityChecker.inspect_chunk(text_chunk, cleaned_result)
 
                     # Repetition or severe quality failure: Auto-retry with lowered temperature (0.1)
@@ -238,6 +267,8 @@ class TranslationOrchestrator(QtCore.QObject):
                             system_instruction=final_system_instruction
                         )
                         retry_cleaned = TextCleaner.clean_text(retry_raw, profile.get_cleaner_patterns())
+                        if not is_epub:
+                            retry_cleaned = TextCleaner.strip_html_tags(retry_cleaned)
                         retry_qc = QualityChecker.inspect_chunk(text_chunk, retry_cleaned)
 
                         if not retry_qc["is_suspicious"]:
@@ -250,6 +281,9 @@ class TranslationOrchestrator(QtCore.QObject):
                                 logger.info(f"Chunk #{idx+1} repetition deduplication fallback applied.")
                             else:
                                 cleaned_result = retry_cleaned
+
+                    if not is_epub:
+                        cleaned_result = TextCleaner.strip_html_tags(cleaned_result)
 
                     translated_dict[idx] = cleaned_result
                     
@@ -327,6 +361,7 @@ class TranslationOrchestrator(QtCore.QObject):
 
             if not self.cancel_requested:
                 final_text = "\n\n".join(results)
+                final_text = TextCleaner.strip_html_tags(final_text)
                 TxtIO.write_text_file(output_path, final_text)
 
         if self.cancel_requested:

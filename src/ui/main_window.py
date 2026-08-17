@@ -5,9 +5,9 @@ OmniTranslator Pro - Main Dashboard Window
 import json
 import asyncio
 from pathlib import Path
-from PySide6 import QtWidgets, QtCore
+from PySide6 import QtWidgets, QtCore, QtGui
 
-from common.paths import get_app_data_path
+from common.paths import get_app_data_path, get_resource_path
 from common.config_loader import ConfigLoader
 from common.logger import setup_logger
 from domain.glossary.extractor import GlossaryExtractor
@@ -40,6 +40,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.setWindowTitle("OmniTranslator Pro - 통합 배치 번역 시스템")
         self.resize(1150, 850)
+
+        # Set application / window icon
+        icon_path = get_resource_path("assets/icons/app_icon.png")
+        if icon_path.exists():
+            self.setWindowIcon(QtGui.QIcon(str(icon_path)))
+
         self._init_ui()
         self._wire_signals()
         

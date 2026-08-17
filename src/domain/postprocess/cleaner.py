@@ -4,10 +4,40 @@ Removes thinking tags, site ad spam, and cleans format artifacts.
 """
 
 import re
+import html
 from typing import List
 
 class TextCleaner:
     """Cleans LLM response text using regex patterns and HTML filter rules."""
+
+    @classmethod
+    def strip_html_tags(cls, text: str) -> str:
+        """
+        Strips residual HTML/XML tags, converts block tags to newlines,
+        and unescapes HTML entities for pure text (TXT) output.
+        """
+        if not text:
+            return ""
+
+        # 1. Remove known virtual wrapper tags explicitly
+        cleaned = re.sub(r'</?(?:main|body|html|head)[^>]*>', '', text, flags=re.IGNORECASE)
+
+        # 2. Replace paragraph / line break tags with newlines to preserve readable paragraph structure
+        cleaned = re.sub(r'<br\s*/?>', '\n', cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r'</?(?:p|div|h[1-6]|li|blockquote|section|article)[^>]*>', '\n', cleaned, flags=re.IGNORECASE)
+
+        # 3. Remove all remaining tags (inline tags like <span>, <b>, <i>, <a>, <ruby>, <rt>, etc.)
+        cleaned = re.sub(r'<[^>]+>', '', cleaned)
+
+        # 4. Decode HTML entities (&nbsp;, &lt;, &gt;, &amp;, &quot;, &#39;, etc.)
+        cleaned = html.unescape(cleaned)
+
+        # 5. Clean trailing/leading whitespace per line and normalize multiple blank lines
+        lines = [line.strip() for line in cleaned.splitlines()]
+        cleaned = "\n".join(lines)
+        cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+
+        return cleaned.strip()
 
     @classmethod
     def clean_html_response(cls, text: str) -> str:

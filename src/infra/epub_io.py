@@ -25,6 +25,19 @@ class EpubIO:
         return book, chapter_items
 
     @classmethod
+    def extract_plain_text(cls, epub_path: Path) -> str:
+        """Extracts clean stripped plain text from all document chapters in the EPUB."""
+        book, chapters = cls.get_epub_chapters(epub_path)
+        text_parts = []
+        for ch in chapters:
+            content = ch.get_content().decode('utf-8', errors='ignore')
+            soup = BeautifulSoup(content, 'html.parser')
+            cleaned = soup.get_text(separator='\n').strip()
+            if cleaned:
+                text_parts.append(cleaned)
+        return "\n\n".join(text_parts)
+
+    @classmethod
     def rebuild_chapter_html(cls, original_html: str, translated_chunks: List[str]) -> str:
         """Reconstructs chapter HTML DOM preserving head and appending translated body contents."""
         soup = BeautifulSoup(original_html, 'html.parser')
