@@ -1,9 +1,10 @@
 """
 OmniTranslator Pro - Quality Assurance & Omission Detector
+Detects content drop (loss of body text), repetition hallucinations, and length anomalies.
 """
 
 import re
-import math
+import html
 from typing import Tuple, Dict, Any, Optional
 from bs4 import BeautifulSoup
 from common.logger import setup_logger
@@ -12,6 +13,20 @@ logger = setup_logger("QualityChecker")
 
 class QualityChecker:
     """Uses length ratio variance, repetition detection, and text presence checks to flag suspected translation defects."""
+
+    @classmethod
+    def extract_clean_text(cls, text: str) -> str:
+        """Extracts plain text stripped of HTML tags and unescaped."""
+        if not text:
+            return ""
+        if '<' in text:
+            try:
+                soup = BeautifulSoup(text, 'html.parser')
+                return html.unescape(soup.get_text(separator=' ', strip=True))
+            except Exception:
+                stripped = re.sub(r'<[^>]+>', ' ', text)
+                return html.unescape(stripped).strip()
+        return html.unescape(text).strip()
 
     @classmethod
     def check_consecutive_repetition(cls, text: str, min_repeats: int = 3) -> Tuple[bool, Optional[str]]:
@@ -27,7 +42,7 @@ class QualityChecker:
         repeat_count = 1
         prev_line = None
         for line in lines:
-            clean_l = BeautifulSoup(line, 'html.parser').get_text(strip=True) if '<' in line else line
+            clean_l = cls.extract_clean_text(line)
             if len(clean_l) >= 4 and clean_l == prev_line:
                 repeat_count += 1
                 if repeat_count >= min_repeats:
@@ -37,7 +52,7 @@ class QualityChecker:
                 prev_line = clean_l
 
         # 2. Sentence-by-sentence repetition check
-        clean_all = BeautifulSoup(text, 'html.parser').get_text(separator='\n', strip=True) if '<' in text else text
+        clean_all = cls.extract_clean_text(text)
         sentences = [s.strip() for s in re.split(r'[\n.!?。！？]+', clean_all) if len(s.strip()) >= 4]
         repeat_count = 1
         prev_sent = None
@@ -61,26 +76,49 @@ class QualityChecker:
 
     @classmethod
     def inspect_chunk(cls, source_text: str, translated_text: str) -> Dict[str, Any]:
-        src_len = len(source_text.strip())
-        trans_len = len(translated_text.strip())
+        """
+        Inspects chunk for Content Drop (missing text), repetition loops, and severe length mismatch.
+        """
+        src_text_clean = cls.extract_clean_text(source_text)
+        trans_text_clean = cls.extract_clean_text(translated_text)
+        src_len = len(src_text_clean)
+        trans_len = len(trans_text_clean)
 
+        # If source has no meaningful text, no anomaly
         if src_len == 0:
-            return {"is_suspicious": False, "ratio": 0.0, "issue": None, "is_repetition": False}
-
-        # Check text presence inside HTML or plain text
-        src_text_clean = BeautifulSoup(source_text, 'html.parser').get_text(strip=True) if "<" in source_text else source_text.strip()
-        trans_text_clean = BeautifulSoup(translated_text, 'html.parser').get_text(strip=True) if "<" in translated_text else translated_text.strip()
-
-        if len(src_text_clean) > 20 and len(trans_text_clean) == 0:
-            logger.warning("Quality Check Alert: Source text present but translated text empty.")
             return {
-                "is_suspicious": True,
+                "is_suspicious": False,
+                "is_content_drop": False,
+                "is_repetition": False,
                 "ratio": 0.0,
-                "issue": "EMPTY_TRANSLATION_TEXT (Source text present but translation text empty)",
-                "is_repetition": False
+                "issue": None
             }
 
-        # Repetition Hallucination Check (3+ consecutive repetitions)
+        # 1. Content Drop Check: Meaningful source text (>=10 chars) but translated text is empty / empty tag
+        if src_len >= 10 and trans_len == 0:
+            issue = f"CONTENT_DROP (원문 {src_len}자 존재하나 번역 결과 본문 누락/빈 태그)"
+            logger.warning(f"Quality Check Alert: {issue}")
+            return {
+                "is_suspicious": True,
+                "is_content_drop": True,
+                "is_repetition": False,
+                "ratio": 0.0,
+                "issue": issue
+            }
+
+        # 2. Extreme Content Drop: Source >= 30 chars but translation < 5 chars
+        if src_len >= 30 and trans_len < 5:
+            issue = f"CONTENT_DROP (원문 {src_len}자 대비 번역문 {trans_len}자로 극단적 본문 유실)"
+            logger.warning(f"Quality Check Alert: {issue}")
+            return {
+                "is_suspicious": True,
+                "is_content_drop": True,
+                "is_repetition": False,
+                "ratio": trans_len / src_len if src_len > 0 else 0.0,
+                "issue": issue
+            }
+
+        # 3. Repetition Hallucination Check (3+ consecutive repetitions)
         is_rep, rep_detail = cls.check_consecutive_repetition(translated_text, min_repeats=3)
         src_is_rep, _ = cls.check_consecutive_repetition(source_text, min_repeats=3) if source_text else (False, None)
 
@@ -89,28 +127,30 @@ class QualityChecker:
             logger.warning(f"Quality Check Alert: {issue}")
             return {
                 "is_suspicious": True,
+                "is_content_drop": False,
+                "is_repetition": True,
                 "ratio": trans_len / src_len if src_len > 0 else 0.0,
-                "issue": issue,
-                "is_repetition": True
+                "issue": issue
             }
 
-        ratio = trans_len / src_len
+        # 4. Length Ratio Anomaly
+        ratio = trans_len / src_len if src_len > 0 else 1.0
         is_suspicious = False
         issue = None
 
-        # Thresholds: Ratio < 0.3 implies omission; Ratio > 3.0 implies hallucination
-        if ratio < 0.3 and len(src_text_clean) > 50:
+        if ratio < 0.25 and src_len > 50:
             is_suspicious = True
-            issue = "OMISSION_SUSPECTED (Translation too short)"
-            logger.warning(f"Quality Check Alert: {issue} (ratio={ratio:.2f})")
-        elif ratio > 3.0 and len(src_text_clean) > 50:
+            issue = f"OMISSION_SUSPECTED (번역문 길이 급감: 비율 {ratio:.2f})"
+            logger.warning(f"Quality Check Alert: {issue}")
+        elif ratio > 3.5 and src_len > 50:
             is_suspicious = True
-            issue = "HALLUCINATION_SUSPECTED (Translation too long)"
-            logger.warning(f"Quality Check Alert: {issue} (ratio={ratio:.2f})")
+            issue = f"HALLUCINATION_SUSPECTED (번역문 길이 급증: 비율 {ratio:.2f})"
+            logger.warning(f"Quality Check Alert: {issue}")
 
         return {
             "is_suspicious": is_suspicious,
+            "is_content_drop": False,
+            "is_repetition": False,
             "ratio": ratio,
-            "issue": issue,
-            "is_repetition": False
+            "issue": issue
         }

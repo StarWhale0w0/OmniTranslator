@@ -1,11 +1,12 @@
 """
 OmniTranslator Pro - Main Orchestrator Engine
-Integrates seamarine EPUB parsing & DOM reconstruction workflow
-with batch_translator Gemini API multi-key async rotation.
+Integrates EPUB parsing & DOM reconstruction workflow with Gemini API multi-key async rotation,
+dynamic glossary injection, content drop recovery, and media bypass.
 """
 
 import asyncio
 import time
+import re
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 from bs4 import BeautifulSoup
@@ -22,8 +23,9 @@ from infra.txt_io import TxtIO
 from domain.profiles.ja_profile import JapaneseProfile
 from domain.profiles.zh_profile import ChineseProfile
 from domain.profiles.en_profile import EnglishProfile
-from domain.chunkers.epub_dom_chunker import EpubDomChunker
-from domain.chunkers.txt_chunker import TxtChunker
+from domain.chunkers.base_chunker import BaseChunker
+from domain.chunkers.dom_chunker import DomChunker, EpubDomChunker
+from domain.chunkers.plain_text_chunker import PlainTextChunker, TxtChunker
 from domain.glossary.extractor import GlossaryExtractor
 from domain.glossary.injector import GlossaryInjector
 from domain.postprocess.cleaner import TextCleaner
@@ -33,7 +35,7 @@ from ui.signals import TranslationSignals
 logger = setup_logger("Orchestrator")
 
 class TranslationOrchestrator(QtCore.QObject):
-    """Pipeline orchestrator combining seamarine EPUB workflow with batch_translator API rotation."""
+    """Pipeline orchestrator combining EPUB DOM preserving workflow with Gemini API rotation."""
 
     def __init__(self, signals: TranslationSignals, config: Dict[str, Any]):
         super().__init__()
@@ -121,7 +123,7 @@ class TranslationOrchestrator(QtCore.QObject):
         active_glossary: Optional[List[Dict[str, Any]]] = None,
         resume_existing: bool = True
     ):
-        """Executes translation pipeline combining seamarine EPUB parser with batch_translator API rotation."""
+        """Executes translation pipeline with content drop prevention, media bypass, and quality checks."""
         self.is_running = True
         self.is_paused = False
         self.cancel_requested = False
@@ -193,10 +195,30 @@ class TranslationOrchestrator(QtCore.QObject):
         prefill_text = self.config.get("prefill_text", "").strip()
         configured_chunk_size = self.config.get("chunk_size", 2000)
 
-        # Helper: Async single chunk translation with batch_translator key rotation & retry
+        # Helper: Async single chunk translation with bypass, validation, retry & fallback
         async def translate_single_chunk(idx: int, text_chunk: str) -> str:
             if idx in translated_dict:
                 return translated_dict[idx]
+
+            # 1. Content and Media Presence Inspection
+            has_text = BaseChunker.has_meaningful_text(text_chunk)
+            has_media = BaseChunker.has_media_tags(text_chunk)
+
+            # Bypass Case A: Media-only chunk (<img>, <svg>, <image>) without translatable text
+            if not has_text and has_media:
+                logger.info(f"Chunk #{idx+1}: Media-only chunk detected. Bypassing LLM call.")
+                self.signals.log_emitted.emit("INFO", f"Chunk #{idx+1}: [미디어 바이패스] 이미지/미디어 태그 원본 유지")
+                self.signals.preview_updated.emit(text_chunk, "[표지/삽화 이미지 구간 - 바이패스됨]")
+                translated_dict[idx] = text_chunk
+                SessionManager.save_checkpoint(input_path, output_path, language, 0, translated_dict, glossary_entries)
+                return text_chunk
+
+            # Bypass Case B: Completely empty tag / whitespace (no text and no media)
+            if not has_text and not has_media:
+                logger.info(f"Chunk #{idx+1}: Empty tag/whitespace chunk detected. Safe pass.")
+                translated_dict[idx] = text_chunk
+                SessionManager.save_checkpoint(input_path, output_path, language, 0, translated_dict, glossary_entries)
+                return text_chunk
 
             async with semaphore:
                 while self.is_paused and not self.cancel_requested:
@@ -247,15 +269,18 @@ class TranslationOrchestrator(QtCore.QObject):
 
                     qc_result = QualityChecker.inspect_chunk(text_chunk, cleaned_result)
 
-                    # Repetition or severe quality failure: Auto-retry with lowered temperature (0.1)
+                    # Repetition, Content Drop, or severe quality defect: Auto-retry with lowered temperature (0.1)
                     if qc_result["is_suspicious"]:
+                        is_content_drop = qc_result.get("is_content_drop", False)
+                        issue_desc = qc_result.get("issue", "품질 불량")
+
                         logger.warning(
-                            f"Chunk #{idx+1} quality check issue ({qc_result['issue']}). "
+                            f"Chunk #{idx+1} quality check issue ({issue_desc}). "
                             f"Retrying with lower temperature (0.1)..."
                         )
                         self.signals.log_emitted.emit(
                             "WARNING",
-                            f"Chunk #{idx+1} 품질 불량 ({qc_result['issue']}) -> 온도 0.1로 자동 재요청(Retry) 중..."
+                            f"Chunk #{idx+1} {issue_desc} -> 온도 0.1로 자동 재요청(Retry) 중..."
                         )
 
                         retry_raw = await self.gemini_client.generate_text_async(
@@ -276,7 +301,17 @@ class TranslationOrchestrator(QtCore.QObject):
                             logger.info(f"Chunk #{idx+1} quality restored successfully on retry.")
                             self.signals.log_emitted.emit("INFO", f"Chunk #{idx+1} 재시도로 품질 정상 복구 완료.")
                         else:
-                            if retry_qc.get("is_repetition"):
+                            # Content Drop Recovery: If retry still resulted in empty text, preserve original source
+                            if retry_qc.get("is_content_drop", False):
+                                logger.error(
+                                    f"Chunk #{idx+1} content drop persisted after retry. Preserving source text to prevent data loss."
+                                )
+                                self.signals.log_emitted.emit(
+                                    "ERROR",
+                                    f"Chunk #{idx+1} 재시도 후에도 본문 누락 지속 -> 본문 유실 방지를 위해 원문으로 안전 복구"
+                                )
+                                cleaned_result = text_chunk
+                            elif retry_qc.get("is_repetition", False):
                                 cleaned_result = TextCleaner.deduplicate_repetitions(retry_cleaned)
                                 logger.info(f"Chunk #{idx+1} repetition deduplication fallback applied.")
                             else:
@@ -285,23 +320,26 @@ class TranslationOrchestrator(QtCore.QObject):
                     if not is_epub:
                         cleaned_result = TextCleaner.strip_html_tags(cleaned_result)
 
+                    # Final Safety Check: If source had meaningful text (>=10 chars) but output has no text, preserve source
+                    if BaseChunker.has_meaningful_text(text_chunk, min_len=10) and not BaseChunker.has_meaningful_text(cleaned_result, min_len=1):
+                        logger.error(f"Chunk #{idx+1} empty output safeguard triggered. Restoring original text chunk.")
+                        self.signals.log_emitted.emit("WARNING", f"Chunk #{idx+1} 최종 출력 공백 감지 -> 원문으로 안전 복원")
+                        cleaned_result = text_chunk
+
                     translated_dict[idx] = cleaned_result
                     
-                    processed_count = len(translated_dict)
-                    elapsed = time.time() - start_time
-                    speed = processed_count / elapsed if elapsed > 0 else 0.1
-                    
-                    self.signals.preview_updated.emit(text_chunk[:300], cleaned_result[:300])
+                    self.signals.preview_updated.emit(text_chunk, cleaned_result)
                     SessionManager.save_checkpoint(input_path, output_path, language, 0, translated_dict, glossary_entries)
                     return cleaned_result
 
                 except Exception as e:
                     logger.error(f"Error processing chunk #{idx+1}: {e}")
-                    self.signals.log_emitted.emit("ERROR", f"Chunk #{idx+1} error: {e}")
+                    self.signals.log_emitted.emit("ERROR", f"Chunk #{idx+1} error (원문 보존): {e}")
+                    translated_dict[idx] = text_chunk
                     return text_chunk
 
         # =========================================================================
-        # EPUB PARSED WORKFLOW (seamarine)
+        # EPUB PARSED WORKFLOW
         # =========================================================================
         if is_epub:
             book, chapters = EpubIO.get_epub_chapters(input_path)
@@ -318,8 +356,8 @@ class TranslationOrchestrator(QtCore.QObject):
                 soup = BeautifulSoup(raw_html, 'html.parser')
                 body = soup.body if soup.body else soup
 
-                # seamarine DOM preserving chunking
-                chunk_tags = EpubDomChunker.chunk_body_preserving_structure(body, max_chars=configured_chunk_size)
+                # DOM preserving recursive chunking
+                chunk_tags = DomChunker.chunk_body_preserving_structure(body, max_chars=configured_chunk_size)
                 
                 ch_tasks = []
                 for chunk_tag in chunk_tags:
@@ -339,7 +377,7 @@ class TranslationOrchestrator(QtCore.QObject):
                         f"챕터 {ch_idx+1}/{total_chapters} 번역 중... ({len(translated_dict)} 청크 완료)"
                     )
 
-                # seamarine HTML DOM reconstruction per chapter
+                # HTML DOM reconstruction per chapter
                 rebuilt_html = EpubIO.rebuild_chapter_html(raw_html, ch_results)
                 chapter.set_content(rebuilt_html.encode('utf-8'))
 
@@ -352,7 +390,7 @@ class TranslationOrchestrator(QtCore.QObject):
         # =========================================================================
         else:
             raw_content = TxtIO.read_text_file(input_path)
-            txt_chunker = TxtChunker()
+            txt_chunker = PlainTextChunker()
             chunks = txt_chunker.split_into_chunks(raw_content, max_size=configured_chunk_size)
             total_chunks = len(chunks)
 

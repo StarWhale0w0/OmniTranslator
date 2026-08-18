@@ -3,16 +3,56 @@ OmniTranslator Pro - Base Chunker Interface
 """
 
 import re
+import html
 from abc import ABC, abstractmethod
 from typing import List
+from bs4 import BeautifulSoup
 
 class BaseChunker(ABC):
-    """Abstract Base Class for text chunkers."""
+    """Abstract Base Class for text chunkers with utility methods for content inspection."""
+
+    MEDIA_TAG_PATTERN = re.compile(r'<(?:img|image|svg|picture|video|audio)\b', re.IGNORECASE)
 
     @abstractmethod
     def split_into_chunks(self, content: str, max_size: int = 6000) -> List[str]:
         """Splits full content into chunk strings of maximum size."""
         pass
+
+    @classmethod
+    def extract_pure_text(cls, content: str) -> str:
+        """Extracts stripped pure text without HTML tags and entities."""
+        if not content:
+            return ""
+        if '<' in content:
+            try:
+                text = BeautifulSoup(content, 'html.parser').get_text(separator=' ', strip=True)
+                return html.unescape(text).strip()
+            except Exception:
+                text = re.sub(r'<[^>]+>', ' ', content)
+                return html.unescape(text).strip()
+        return html.unescape(content).strip()
+
+    @classmethod
+    def has_meaningful_text(cls, content: str, min_len: int = 1) -> bool:
+        """Returns True if content contains meaningful non-whitespace text of at least min_len chars."""
+        return len(cls.extract_pure_text(content)) >= min_len
+
+    @classmethod
+    def has_media_tags(cls, content: str) -> bool:
+        """Checks if content contains media elements like img, svg, image, picture, video, audio."""
+        if not content:
+            return False
+        return bool(cls.MEDIA_TAG_PATTERN.search(content))
+
+    @classmethod
+    def is_media_only_chunk(cls, content: str) -> bool:
+        """Returns True if chunk has media tags but no meaningful text."""
+        return cls.has_media_tags(content) and not cls.has_meaningful_text(content)
+
+    @classmethod
+    def is_empty_chunk(cls, content: str) -> bool:
+        """Returns True if chunk has neither text nor media tags."""
+        return not cls.has_meaningful_text(content) and not cls.has_media_tags(content)
 
     def split_chunk_binary(self, chunk_text: str) -> List[str]:
         """Splits a single chunk into two equal halves (for safety retry isolation)."""
