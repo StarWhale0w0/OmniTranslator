@@ -13,3 +13,4 @@ class TranslationSignals(QtCore.QObject):
     completed = QtCore.Signal(bool, str)              # success, message/error_details
     glossary_extracted = QtCore.Signal(list)          # extracted entries list
     glossary_loading = QtCore.Signal(bool, str)       # is_loading, message
+    glossary_completed = QtCore.Signal(bool, str, int) # success, file_path_str, terms_count

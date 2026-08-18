@@ -1,7 +1,10 @@
 """
 OmniTranslator Pro - Main Orchestrator Engine
-Integrates EPUB parsing & DOM reconstruction workflow with Gemini API multi-key async rotation,
-dynamic glossary injection, content drop recovery, and media bypass.
+Revamped SeaMarine / Novel Batch Translator Pipeline:
+1. Tag Masking ([TAG_N] placeholders) isolating media & HTML tags from AI.
+2. Instant pass for pure image chapters (< 10 translatable chars).
+3. Simplified, censorship-resistant prompts.
+4. Secondary fallback translation (GoogleTranslator via deep-translator) on Gemini blocks/errors.
 """
 
 import asyncio
@@ -17,6 +20,7 @@ from common.logger import setup_logger
 from core.session_manager import SessionManager
 from infra.key_manager import KeyManager
 from infra.gemini_client import GeminiClient
+from infra.fallback_translator import FallbackTranslator
 from infra.epub_io import EpubIO
 from infra.txt_io import TxtIO
 
@@ -30,12 +34,13 @@ from domain.glossary.extractor import GlossaryExtractor
 from domain.glossary.injector import GlossaryInjector
 from domain.postprocess.cleaner import TextCleaner
 from domain.postprocess.quality_checker import QualityChecker
+from domain.postprocess.tag_masker import TagMasker
 from ui.signals import TranslationSignals
 
 logger = setup_logger("Orchestrator")
 
 class TranslationOrchestrator(QtCore.QObject):
-    """Pipeline orchestrator combining EPUB DOM preserving workflow with Gemini API rotation."""
+    """Pipeline orchestrator implementing SeaMarine tag masking and multi-tier fallback translation."""
 
     def __init__(self, signals: TranslationSignals, config: Dict[str, Any]):
         super().__init__()
@@ -98,7 +103,8 @@ class TranslationOrchestrator(QtCore.QObject):
                 file_path=input_path,
                 lang_code=language,
                 model_name=gloss_model,
-                progress_callback=on_progress
+                progress_callback=on_progress,
+                resume_existing=True
             )
 
             glossary_file = input_path.parent / f"{input_path.name}.glossary.json"
@@ -109,11 +115,13 @@ class TranslationOrchestrator(QtCore.QObject):
             self.signals.glossary_loading.emit(False, success_msg)
             self.signals.status_changed.emit(success_msg)
             self.signals.log_emitted.emit("INFO", f"AI 용어 전수 추출 완료: {len(entries)}개 고유명사 저장됨 ({glossary_file.name})")
+            self.signals.glossary_completed.emit(True, str(glossary_file), len(entries))
 
         except Exception as e:
             logger.error(f"Glossary extraction pipeline failed: {e}")
             self.signals.glossary_loading.emit(False, f"추출 실패: {e}")
             self.signals.log_emitted.emit("ERROR", f"용어 추출 중 오류 발생: {e}")
+            self.signals.glossary_completed.emit(False, str(e), 0)
 
     async def run_pipeline_async(
         self,
@@ -123,7 +131,10 @@ class TranslationOrchestrator(QtCore.QObject):
         active_glossary: Optional[List[Dict[str, Any]]] = None,
         resume_existing: bool = True
     ):
-        """Executes translation pipeline with content drop prevention, media bypass, and quality checks."""
+        """
+        Executes SeaMarine / Novel Batch Translation pipeline:
+        Tag Masking -> Pure Image Instant Pass -> Gemini Translation -> 2nd Fallback (GoogleTranslator) -> Tag Unmasking.
+        """
         self.is_running = True
         self.is_paused = False
         self.cancel_requested = False
@@ -135,44 +146,24 @@ class TranslationOrchestrator(QtCore.QObject):
         # Update KeyManager delay settings
         self.key_manager.set_request_delay(self.config.get("request_delay", 0.5))
 
-        # Retrieve system prompt & custom rules from config
+        # Retrieve system prompt & custom rules
         prompt_cfg = self.config.get("prompts", {}).get(language.upper(), {})
         base_sys_prompt = prompt_cfg.get("system_prompt", profile.get_system_instruction(is_epub=is_epub))
         custom_rules = prompt_cfg.get("custom_rules", "").strip()
 
         final_system_instruction = base_sys_prompt
         if custom_rules:
-            final_system_instruction += f"\n\n## Additional User Custom Rules:\n{custom_rules}"
-
-        # If translating TXT, adjust system instruction to strip HTML mandates and enforce pure text
-        if not is_epub:
-            final_system_instruction = re.sub(
-                r'Do NOT translate, modify, or strip any HTML tags[^\n]*',
-                'Translate into pure plain text without HTML tags.',
-                final_system_instruction,
-                flags=re.IGNORECASE
-            )
-            final_system_instruction = re.sub(
-                r'Return raw HTML only\.?',
-                'Return plain novel text only without HTML tags.',
-                final_system_instruction,
-                flags=re.IGNORECASE
-            )
-            if "HTML 태그를 일절 생성하지 마십시오" not in final_system_instruction and "순수 소설 텍스트" not in final_system_instruction:
-                final_system_instruction += (
-                    "\n\n[TXT 포맷 규칙]\n"
-                    "본 문서는 순수 텍스트(TXT) 문서입니다. 원문에 없던 <main>, <div>, <p>, <span> 등의 HTML 태그를 일절 생성하지 말고 순수 소설 텍스트로만 출력하십시오."
-                )
+            final_system_instruction += f"\n\n## Custom Rules:\n{custom_rules}"
 
         strict_meta_rule = (
             "\n\n[출력 절대 규칙]\n"
-            "절대로 번역 과정, 검토 메모, 체크리스트, 'Final check' 등의 메타 텍스트를 출력하지 마십시오. "
-            "오직 최종 번역된 본문 HTML/텍스트만을 출력하십시오."
+            "절대로 번역 과정, 검토 메모, 체크리스트 등의 메타 텍스트를 출력하지 마십시오. "
+            "오직 최종 번역된 본문 텍스트만을 출력하십시오."
         )
         if "절대로 번역 과정" not in final_system_instruction:
             final_system_instruction += strict_meta_rule
 
-        # Load or use passed glossary entries
+        # Load glossary
         glossary_file = input_path.parent / f"{input_path.name}.glossary.json"
         glossary_entries: List[Dict[str, Any]] = active_glossary if active_glossary is not None else GlossaryExtractor.load_glossary_json(glossary_file)
 
@@ -195,27 +186,23 @@ class TranslationOrchestrator(QtCore.QObject):
         prefill_text = self.config.get("prefill_text", "").strip()
         configured_chunk_size = self.config.get("chunk_size", 2000)
 
-        # Helper: Async single chunk translation with bypass, validation, retry & fallback
+        # Helper: Async single chunk translation with SeaMarine Tag Masking & GoogleTranslator Fallback
         async def translate_single_chunk(idx: int, text_chunk: str) -> str:
             if idx in translated_dict:
                 return translated_dict[idx]
 
-            # 1. Content and Media Presence Inspection
-            has_text = BaseChunker.has_meaningful_text(text_chunk)
-            has_media = BaseChunker.has_media_tags(text_chunk)
+            # 1. Tag Masking: Isolate HTML/XML/Media tags into [TAG_N] placeholders
+            masked_text, tag_map, pure_text = TagMasker.mask_tags(text_chunk)
+            pure_len = len(pure_text.strip())
 
-            # Bypass Case A: Media-only chunk (<img>, <svg>, <image>) without translatable text
-            if not has_text and has_media:
-                logger.info(f"Chunk #{idx+1}: Media-only chunk detected. Bypassing LLM call.")
-                self.signals.log_emitted.emit("INFO", f"Chunk #{idx+1}: [미디어 바이패스] 이미지/미디어 태그 원본 유지")
+            # 2. Pure Image / Media Instant Pass (< 10 translatable characters)
+            if pure_len < 10 and (BaseChunker.has_media_tags(text_chunk) or pure_len == 0):
+                logger.info(
+                    f"Chunk #{idx+1}: [순수 이미지/미디어 즉시 패스] "
+                    f"번역 대상 텍스트 {pure_len}자 (< 10자) -> API 호출 없이 원본 태그 즉시 반환"
+                )
+                self.signals.log_emitted.emit("INFO", f"Chunk #{idx+1}: [미디어 패스] 순수 이미지/삽화 챕터 즉시 바이패스")
                 self.signals.preview_updated.emit(text_chunk, "[표지/삽화 이미지 구간 - 바이패스됨]")
-                translated_dict[idx] = text_chunk
-                SessionManager.save_checkpoint(input_path, output_path, language, 0, translated_dict, glossary_entries)
-                return text_chunk
-
-            # Bypass Case B: Completely empty tag / whitespace (no text and no media)
-            if not has_text and not has_media:
-                logger.info(f"Chunk #{idx+1}: Empty tag/whitespace chunk detected. Safe pass.")
                 translated_dict[idx] = text_chunk
                 SessionManager.save_checkpoint(input_path, output_path, language, 0, translated_dict, glossary_entries)
                 return text_chunk
@@ -227,21 +214,19 @@ class TranslationOrchestrator(QtCore.QObject):
                 if self.cancel_requested:
                     return text_chunk
 
-                # Inject dynamic glossary
+                # 3. Dynamic Glossary Injection on masked text
                 glossary_context = GlossaryInjector.inject_glossary_context(
-                    text_chunk, glossary_entries, enabled=use_glossary
+                    masked_text, glossary_entries, enabled=use_glossary
                 )
                 prompt_template = profile.get_prompt_template(is_epub=is_epub)
-                prompt_str = prompt_template.replace("{{slot}}", text_chunk).replace("{{glossary_context}}", glossary_context)
+                prompt_str = prompt_template.replace("{{slot}}", masked_text).replace("{{glossary_context}}", glossary_context)
 
-                # Prepare contents & prefill history
+                # Prepare prompt contents
                 prompt_contents: List[genai_types.Content] = []
                 if self.config.get("enable_prefill", True):
                     history_raw = profile.get_prefill_history(is_epub=is_epub)
                     for item in history_raw:
                         p_text = prefill_text if item["role"] == "model" and prefill_text else item["parts"][0]
-                        if not is_epub:
-                            p_text = p_text.replace("raw HTML structure", "plain text structure").replace("preserving all HTML tags", "in pure novel prose without HTML tags")
                         prompt_contents.append(
                             genai_types.Content(
                                 role=item["role"],
@@ -252,6 +237,10 @@ class TranslationOrchestrator(QtCore.QObject):
                     genai_types.Content(role="user", parts=[genai_types.Part.from_text(text=prompt_str)])
                 )
 
+                translated_masked = ""
+                used_fallback = False
+
+                # 4. Primary Translation: Gemini API
                 try:
                     init_temp = self.config.get("temperature", 0.3)
                     result_raw = await self.gemini_client.generate_text_async(
@@ -259,87 +248,76 @@ class TranslationOrchestrator(QtCore.QObject):
                         model_name=trans_model,
                         temperature=init_temp,
                         top_p=self.config.get("top_p", 0.9),
-                        thinking_budget=0,
-                        system_instruction=final_system_instruction
+                        thinking_budget=None,
+                        system_instruction=final_system_instruction,
+                        raw_fallback_text=masked_text
                     )
 
-                    cleaned_result = TextCleaner.clean_text(result_raw, profile.get_cleaner_patterns())
-                    if not is_epub:
-                        cleaned_result = TextCleaner.strip_html_tags(cleaned_result)
-
-                    qc_result = QualityChecker.inspect_chunk(text_chunk, cleaned_result)
-
-                    # Repetition, Content Drop, or severe quality defect: Auto-retry with lowered temperature (0.1)
-                    if qc_result["is_suspicious"]:
-                        is_content_drop = qc_result.get("is_content_drop", False)
-                        issue_desc = qc_result.get("issue", "품질 불량")
-
+                    # Check if Gemini blocked or returned raw fallback
+                    if result_raw == masked_text or not result_raw.strip():
                         logger.warning(
-                            f"Chunk #{idx+1} quality check issue ({issue_desc}). "
-                            f"Retrying with lower temperature (0.1)..."
+                            f"Chunk #{idx+1}: Gemini 차단 또는 빈 응답 -> 2차 폴백(GoogleTranslator) 즉시 가동."
                         )
                         self.signals.log_emitted.emit(
                             "WARNING",
-                            f"Chunk #{idx+1} {issue_desc} -> 온도 0.1로 자동 재요청(Retry) 중..."
+                            f"Chunk #{idx+1}: [2차 폴백 가동] Gemini 차단 감지 -> GoogleTranslator로 즉시 번역 전환"
                         )
-
-                        retry_raw = await self.gemini_client.generate_text_async(
-                            prompt_contents=prompt_contents,
-                            model_name=trans_model,
-                            temperature=0.1,
-                            top_p=self.config.get("top_p", 0.9),
-                            thinking_budget=0,
-                            system_instruction=final_system_instruction
+                        translated_masked = await FallbackTranslator.translate_async(
+                            masked_text, source_lang=language, target_lang="KO"
                         )
-                        retry_cleaned = TextCleaner.clean_text(retry_raw, profile.get_cleaner_patterns())
-                        if not is_epub:
-                            retry_cleaned = TextCleaner.strip_html_tags(retry_cleaned)
-                        retry_qc = QualityChecker.inspect_chunk(text_chunk, retry_cleaned)
+                        used_fallback = True
+                    else:
+                        cleaned = TextCleaner.clean_text(result_raw, profile.get_cleaner_patterns())
+                        qc_result = QualityChecker.inspect_chunk(masked_text, cleaned)
 
-                        if not retry_qc["is_suspicious"]:
-                            cleaned_result = retry_cleaned
-                            logger.info(f"Chunk #{idx+1} quality restored successfully on retry.")
-                            self.signals.log_emitted.emit("INFO", f"Chunk #{idx+1} 재시도로 품질 정상 복구 완료.")
+                        # If QualityChecker detects Content Drop or severe defect:
+                        if qc_result["is_suspicious"] and qc_result.get("is_content_drop", False):
+                            logger.warning(
+                                f"Chunk #{idx+1}: 본문 누락 감지 ({qc_result['issue']}) -> GoogleTranslator 폴백 번역 실행."
+                            )
+                            self.signals.log_emitted.emit(
+                                "WARNING",
+                                f"Chunk #{idx+1}: [본문 누락 방지] GoogleTranslator 폴백 번역 실행"
+                            )
+                            translated_masked = await FallbackTranslator.translate_async(
+                                masked_text, source_lang=language, target_lang="KO"
+                            )
+                            used_fallback = True
                         else:
-                            # Content Drop Recovery: If retry still resulted in empty text, preserve original source
-                            if retry_qc.get("is_content_drop", False):
-                                logger.error(
-                                    f"Chunk #{idx+1} content drop persisted after retry. Preserving source text to prevent data loss."
-                                )
-                                self.signals.log_emitted.emit(
-                                    "ERROR",
-                                    f"Chunk #{idx+1} 재시도 후에도 본문 누락 지속 -> 본문 유실 방지를 위해 원문으로 안전 복구"
-                                )
-                                cleaned_result = text_chunk
-                            elif retry_qc.get("is_repetition", False):
-                                cleaned_result = TextCleaner.deduplicate_repetitions(retry_cleaned)
-                                logger.info(f"Chunk #{idx+1} repetition deduplication fallback applied.")
-                            else:
-                                cleaned_result = retry_cleaned
-
-                    if not is_epub:
-                        cleaned_result = TextCleaner.strip_html_tags(cleaned_result)
-
-                    # Final Safety Check: If source had meaningful text (>=10 chars) but output has no text, preserve source
-                    if BaseChunker.has_meaningful_text(text_chunk, min_len=10) and not BaseChunker.has_meaningful_text(cleaned_result, min_len=1):
-                        logger.error(f"Chunk #{idx+1} empty output safeguard triggered. Restoring original text chunk.")
-                        self.signals.log_emitted.emit("WARNING", f"Chunk #{idx+1} 최종 출력 공백 감지 -> 원문으로 안전 복원")
-                        cleaned_result = text_chunk
-
-                    translated_dict[idx] = cleaned_result
-                    
-                    self.signals.preview_updated.emit(text_chunk, cleaned_result)
-                    SessionManager.save_checkpoint(input_path, output_path, language, 0, translated_dict, glossary_entries)
-                    return cleaned_result
+                            translated_masked = cleaned
 
                 except Exception as e:
-                    logger.error(f"Error processing chunk #{idx+1}: {e}")
-                    self.signals.log_emitted.emit("ERROR", f"Chunk #{idx+1} error (원문 보존): {e}")
-                    translated_dict[idx] = text_chunk
-                    return text_chunk
+                    logger.error(f"Chunk #{idx+1}: Gemini 예외 발생 ({e}) -> GoogleTranslator 2차 폴백 가동.")
+                    self.signals.log_emitted.emit(
+                        "WARNING",
+                        f"Chunk #{idx+1}: [2차 폴백 가동] Gemini 오류 발생으로 GoogleTranslator 번역 실행 ({e})"
+                    )
+                    translated_masked = await FallbackTranslator.translate_async(
+                        masked_text, source_lang=language, target_lang="KO"
+                    )
+                    used_fallback = True
+
+                # 5. Tag Unmasking: Restore [TAG_N] placeholders back to original HTML tags
+                final_translated = TagMasker.unmask_tags(translated_masked, tag_map)
+
+                if not is_epub:
+                    final_translated = TextCleaner.strip_html_tags(final_translated)
+
+                # Final Safeguard: Ensure non-empty output
+                if not final_translated.strip():
+                    logger.warning(f"Chunk #{idx+1}: 최종 출력 공백 -> 원문 태그 안전 보존")
+                    final_translated = text_chunk
+
+                translated_dict[idx] = final_translated
+                
+                # Update UI preview and checkpoint
+                preview_status = " [GoogleTranslator 폴백]" if used_fallback else ""
+                self.signals.preview_updated.emit(text_chunk, final_translated + preview_status)
+                SessionManager.save_checkpoint(input_path, output_path, language, 0, translated_dict, glossary_entries)
+                return final_translated
 
         # =========================================================================
-        # EPUB PARSED WORKFLOW
+        # EPUB PARSED WORKFLOW (SeaMarine chapter reconstruction)
         # =========================================================================
         if is_epub:
             book, chapters = EpubIO.get_epub_chapters(input_path)

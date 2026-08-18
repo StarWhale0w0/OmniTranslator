@@ -76,14 +76,14 @@ QTabBar::tab {
     border: 1px solid #2E2E32;
     padding: 8px 16px;
     color: #A0A0AA;
-    border_top_left_radius: 4px;
-    border_top_right_radius: 4px;
+    border-top-left-radius: 4px;
+    border-top-right-radius: 4px;
 }
 
 QTabBar::tab:selected {
     background: #25252A;
     color: #8E75FF;
-    border_bottom_color: #8E75FF;
+    border-bottom-color: #8E75FF;
     font-weight: bold;
 }
 

@@ -168,6 +168,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.signals.completed.connect(self._on_completed)
         self.signals.glossary_extracted.connect(self.glossary_table.set_entries)
         self.signals.glossary_loading.connect(self.glossary_table.set_loading)
+        self.signals.glossary_completed.connect(self._on_glossary_completed)
         self.glossary_table.extract_requested.connect(self._trigger_glossary_extraction)
         self.lang_toggle.language_changed.connect(self._update_title_badge)
 
@@ -186,11 +187,21 @@ class MainWindow(QtWidgets.QMainWindow):
 
             # 2. Check for per-file glossary json (e.g. A_novel.epub.glossary.json)
             glossary_file = p.parent / f"{p.name}.glossary.json"
+            tmp_glossary_file = p.parent / f"{p.name}.glossary.tmp.json"
             if glossary_file.exists():
                 entries = GlossaryExtractor.load_glossary_json(glossary_file)
                 self.glossary_table.set_entries(entries)
                 logger.info(f"Loaded isolated glossary ({len(entries)} items) for {p.name}")
                 self.status_label.setText(f"작품 용어집 로드됨 ({len(entries)}개 용어)")
+            elif tmp_glossary_file.exists():
+                tmp_ckpt = GlossaryExtractor.load_checkpoint(tmp_glossary_file)
+                if tmp_ckpt:
+                    done_b = len(tmp_ckpt.get("completed_blocks", []))
+                    tot_b = tmp_ckpt.get("total_blocks", 0)
+                    terms_n = len(tmp_ckpt.get("merged_glossary", {}))
+                    self.status_label.setText(
+                        f"⏳ 용어집 추출 임시 저장됨 ({done_b}/{tot_b} 블록 완료, {terms_n}개 용어). [AI 용어집 추출] 클릭 시 이어서 분석됩니다."
+                    )
             else:
                 self.status_label.setText("작품 용어집 없음. [📖 용어집 관리] 탭에서 [🔍 AI 용어집 추출]을 눌러 생성할 수 있습니다.")
 
@@ -304,3 +315,32 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.information(self, "완료", info)
         else:
             QtWidgets.QMessageBox.warning(self, "알림", info)
+
+    def _on_glossary_completed(self, success: bool, file_path_str: str, terms_count: int):
+        """Plays completion sound, flashes taskbar, and shows modal popup when glossary extraction completes."""
+        if success:
+            # 1. Beep Sound Notification
+            try:
+                import winsound
+                winsound.MessageBeep(winsound.MB_ICONASTERISK)
+            except Exception:
+                QtWidgets.QApplication.beep()
+
+            # 2. Window alert / Taskbar Flash
+            self.alert(0)
+
+            # 3. Informational Message Box
+            fname = Path(file_path_str).name
+            QtWidgets.QMessageBox.information(
+                self,
+                "AI 용어집 추출 완료",
+                f"🎉 총 {terms_count}개의 고유명사 AI 전수 용어집 추출이 완료되었습니다!\n\n"
+                f"📁 저장 파일: {fname}\n\n"
+                f"[📖 용어집 관리] 탭에서 추출된 용어를 확인하고 직접 수정할 수 있습니다."
+            )
+        else:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "용어집 추출 실패",
+                f"용어집 추출 중 오류가 발생했습니다:\n{file_path_str}"
+            )

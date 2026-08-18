@@ -1,6 +1,7 @@
 """
 OmniTranslator Pro - AI Glossary Extractor (Map-Reduce Full Document Scanner)
-Extracts terms (characters, places, items, proper nouns) into JSON format with language rules.
+Extracts terms (characters, places, items, proper nouns) into JSON format with language rules,
+real-time atomic checkpointing, and resume support.
 """
 
 import json
@@ -15,7 +16,7 @@ from infra.epub_io import EpubIO
 logger = setup_logger("GlossaryExtractor")
 
 class GlossaryExtractor:
-    """Extracts terms from entire document text into unified JSON glossary using Gemini AI Map-Reduce pipeline."""
+    """Extracts terms from entire document text into unified JSON glossary using Gemini AI Map-Reduce pipeline with atomic checkpointing."""
 
     PROMPT_TEMPLATE = (
         "당신은 {lang_code} 원작 소설/문학의 최고 전문 번역가이자 고유명사 용어집 구축 전문가입니다.\n"
@@ -46,6 +47,46 @@ class GlossaryExtractor:
               "2. 한자 고유명사와 가타카나 외래어 표기법을 정확히 적용하십시오.",
         "EN": "1. 영어 인명, 지명, 판타지/SF 고유명사는 국립국어원 외래어 표기법에 맞춰 한글로 자연스럽게 음역하십시오."
     }
+
+    @classmethod
+    def get_tmp_checkpoint_path(cls, file_path: Path) -> Path:
+        """Returns the temporary checkpoint path for glossary extraction."""
+        return file_path.parent / f"{file_path.name}.glossary.tmp.json"
+
+    @classmethod
+    def save_checkpoint(cls, checkpoint_path: Path, data: Dict[str, Any]) -> None:
+        """Atomically saves intermediate glossary extraction progress."""
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = checkpoint_path.with_suffix(".tmp_write")
+        try:
+            with open(temp_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            temp_path.replace(checkpoint_path)
+            logger.debug(f"Atomic glossary checkpoint saved: {checkpoint_path} ({len(data.get('completed_blocks', []))} blocks done)")
+        except Exception as e:
+            logger.error(f"Failed to save atomic glossary checkpoint ({checkpoint_path}): {e}")
+
+    @classmethod
+    def load_checkpoint(cls, checkpoint_path: Path) -> Optional[Dict[str, Any]]:
+        """Loads intermediate glossary extraction progress."""
+        if not checkpoint_path.exists():
+            return None
+        try:
+            with open(checkpoint_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            logger.error(f"Failed to load glossary checkpoint ({checkpoint_path}): {e}")
+            return None
+
+    @classmethod
+    def remove_checkpoint(cls, checkpoint_path: Path) -> None:
+        """Removes the temporary glossary checkpoint file upon clean completion."""
+        if checkpoint_path.exists():
+            try:
+                checkpoint_path.unlink()
+                logger.info(f"Removed temporary glossary checkpoint: {checkpoint_path}")
+            except Exception as e:
+                logger.error(f"Failed to remove temporary glossary checkpoint ({checkpoint_path}): {e}")
 
     @classmethod
     def load_document_text(cls, file_path: Path) -> str:
@@ -142,17 +183,20 @@ class GlossaryExtractor:
         lang_code: str = "JA",
         model_name: str = "gemini-2.5-flash",
         block_size: int = 18000,
-        progress_callback: Optional[Callable[[int, int, int], None]] = None
+        progress_callback: Optional[Callable[[int, int, int], None]] = None,
+        resume_existing: bool = True
     ) -> List[Dict[str, Any]]:
-        """Full-document Map-Reduce AI glossary extraction from file path."""
+        """Full-document Map-Reduce AI glossary extraction from file path with automatic checkpoint recovery."""
         text_content = cls.load_document_text(file_path)
+        checkpoint_path = cls.get_tmp_checkpoint_path(file_path) if resume_existing else None
         return await cls.extract_glossary_from_text_async(
             gemini_client=gemini_client,
             text_content=text_content,
             lang_code=lang_code,
             model_name=model_name,
             block_size=block_size,
-            progress_callback=progress_callback
+            progress_callback=progress_callback,
+            checkpoint_path=checkpoint_path
         )
 
     @classmethod
@@ -163,22 +207,42 @@ class GlossaryExtractor:
         lang_code: str = "JA",
         model_name: str = "gemini-2.5-flash",
         block_size: int = 18000,
-        progress_callback: Optional[Callable[[int, int, int], None]] = None
+        progress_callback: Optional[Callable[[int, int, int], None]] = None,
+        checkpoint_path: Optional[Path] = None
     ) -> List[Dict[str, Any]]:
-        """Extracts terms from all text blocks using Map-Reduce and merges by occurrence count."""
+        """Extracts terms from all text blocks with real-time atomic checkpoint saving and resumption."""
         blocks = cls.split_into_blocks(text_content, block_size=block_size)
         total_blocks = len(blocks)
         if total_blocks == 0:
             logger.warning("Empty text provided for glossary extraction.")
             return []
 
-        logger.info(f"Starting full-document glossary extraction: {len(text_content)} chars split into {total_blocks} blocks.")
-
         rules = cls.LANG_RULES.get(lang_code.upper(), cls.LANG_RULES["JA"])
         merged_glossary: Dict[str, Dict[str, Any]] = {}
         trans_counts: Dict[str, Dict[str, int]] = {}
+        completed_blocks: List[int] = []
+
+        # 1. Load existing checkpoint if present
+        if checkpoint_path and checkpoint_path.exists():
+            ckpt = cls.load_checkpoint(checkpoint_path)
+            if ckpt and isinstance(ckpt, dict):
+                merged_glossary = ckpt.get("merged_glossary", {})
+                trans_counts = ckpt.get("trans_counts", {})
+                completed_blocks = ckpt.get("completed_blocks", [])
+                logger.info(
+                    f"Resuming glossary extraction from checkpoint ({checkpoint_path.name}): "
+                    f"{len(completed_blocks)}/{total_blocks} blocks already extracted ({len(merged_glossary)} terms)."
+                )
+                if progress_callback and completed_blocks:
+                    progress_callback(len(completed_blocks), total_blocks, len(merged_glossary))
+
+        logger.info(f"Starting glossary extraction: {total_blocks} total blocks ({len(completed_blocks)} already completed).")
 
         for idx, block in enumerate(blocks, start=1):
+            if idx in completed_blocks:
+                logger.info(f"Glossary block {idx}/{total_blocks} already in checkpoint. Bypassing...")
+                continue
+
             prompt_str = cls.PROMPT_TEMPLATE.format(
                 lang_code=lang_code,
                 rules=rules,
@@ -230,19 +294,30 @@ class GlossaryExtractor:
                             trans_counts[kw][tr] = 0
                         trans_counts[kw][tr] += cnt
 
-                        # Elect the translation with the highest aggregate count
+                        # Elect translation with highest aggregate count
                         best_tr = max(trans_counts[kw].items(), key=lambda x: x[1])[0]
                         merged_glossary[kw]["translated_keyword"] = best_tr
 
-                        # Preserve more specific categories if updated
                         if cat != "고유명사" and merged_glossary[kw]["category"] == "고유명사":
                             merged_glossary[kw]["category"] = cat
+
+                completed_blocks.append(idx)
+
+                # Real-time atomic checkpoint save
+                if checkpoint_path:
+                    ckpt_data = {
+                        "total_blocks": total_blocks,
+                        "completed_blocks": completed_blocks,
+                        "merged_glossary": merged_glossary,
+                        "trans_counts": trans_counts
+                    }
+                    cls.save_checkpoint(checkpoint_path, ckpt_data)
 
             except Exception as e:
                 logger.error(f"Error extracting terms from block {idx}/{total_blocks}: {e}")
 
             if progress_callback:
-                progress_callback(idx, total_blocks, len(merged_glossary))
+                progress_callback(len(completed_blocks), total_blocks, len(merged_glossary))
 
         # Sort by occurrence_count descending
         final_entries = sorted(
@@ -250,6 +325,10 @@ class GlossaryExtractor:
             key=lambda x: x.get("occurrence_count", 1),
             reverse=True
         )
+
+        # Remove temporary checkpoint upon 100% completion
+        if checkpoint_path and len(completed_blocks) == total_blocks:
+            cls.remove_checkpoint(checkpoint_path)
 
         logger.info(f"Full-document glossary extraction complete: {len(final_entries)} unique terms aggregated from {total_blocks} blocks.")
         return final_entries
@@ -274,6 +353,7 @@ class GlossaryExtractor:
 
     @classmethod
     def save_glossary_json(cls, entries: List[Dict[str, Any]], filepath: Path) -> None:
+        """Saves final verified glossary JSON file."""
         filepath.parent.mkdir(parents=True, exist_ok=True)
         with open(filepath, 'w', encoding='utf-8') as f:
             json.dump(entries, f, ensure_ascii=False, indent=2)
@@ -281,6 +361,7 @@ class GlossaryExtractor:
 
     @classmethod
     def load_glossary_json(cls, filepath: Path) -> List[Dict[str, Any]]:
+        """Loads existing glossary JSON file."""
         if not filepath.exists():
             return []
         try:

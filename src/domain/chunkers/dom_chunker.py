@@ -27,7 +27,7 @@ class DomChunker(BaseChunker):
         ensuring child tags or strings are properly distributed without exceeding max_chars.
         """
         tag_str = str(tag)
-        if len(tag_str) <= max_chars:
+        if len(tag_str) <= max_chars or cls.is_media_only_chunk(tag_str):
             return [tag]
 
         # If tag has no children
@@ -44,6 +44,17 @@ class DomChunker(BaseChunker):
                 continue
 
             child_str = str(child)
+
+            # If child is media-only (SVG, figure, img), keep it intact
+            if cls.is_media_only_chunk(child_str):
+                if current_wrapper.contents:
+                    result_chunks.append(copy.copy(current_wrapper))
+                    current_wrapper.clear()
+                wrapper_for_media = tag.__copy__()
+                wrapper_for_media.clear()
+                wrapper_for_media.append(child)
+                result_chunks.append(wrapper_for_media)
+                continue
 
             # If a single child tag is itself oversized, split it recursively
             if len(child_str) > max_chars:
@@ -105,6 +116,14 @@ class DomChunker(BaseChunker):
                 continue
 
             element_str = str(element)
+
+            # If element is media-only, pack as discrete chunk
+            if cls.is_media_only_chunk(element_str):
+                if current_chunk.contents:
+                    chunks.append(copy.copy(current_chunk))
+                    current_chunk.clear()
+                chunks.append(element)
+                continue
 
             # If element is oversized, process with recursive splitting
             if len(element_str) > max_chars:

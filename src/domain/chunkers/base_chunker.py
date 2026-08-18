@@ -9,9 +9,14 @@ from typing import List
 from bs4 import BeautifulSoup
 
 class BaseChunker(ABC):
-    """Abstract Base Class for text chunkers with utility methods for content inspection."""
+    """Abstract Base Class for text chunkers with comprehensive content & media inspection utilities."""
 
-    MEDIA_TAG_PATTERN = re.compile(r'<(?:img|image|svg|picture|video|audio)\b', re.IGNORECASE)
+    MEDIA_TAGS = {'img', 'image', 'svg', 'picture', 'figure', 'figcaption', 'video', 'audio', 'canvas', 'object', 'embed'}
+    IGNORED_TEXT_TAGS = {'head', 'title', 'meta', 'link', 'style', 'script'}
+    MEDIA_TAG_PATTERN = re.compile(
+        r'<(?:img|image|svg|picture|figure|figcaption|video|audio|canvas|object|embed)\b',
+        re.IGNORECASE
+    )
 
     @abstractmethod
     def split_into_chunks(self, content: str, max_size: int = 6000) -> List[str]:
@@ -20,38 +25,62 @@ class BaseChunker(ABC):
 
     @classmethod
     def extract_pure_text(cls, content: str) -> str:
-        """Extracts stripped pure text without HTML tags and entities."""
+        """Extracts stripped text excluding metadata/header tags."""
         if not content:
             return ""
         if '<' in content:
             try:
-                text = BeautifulSoup(content, 'html.parser').get_text(separator=' ', strip=True)
+                soup = BeautifulSoup(content, 'html.parser')
+                for tag in soup.find_all(list(cls.IGNORED_TEXT_TAGS)):
+                    tag.decompose()
+                text = soup.get_text(separator=' ', strip=True)
                 return html.unescape(text).strip()
             except Exception:
-                text = re.sub(r'<[^>]+>', ' ', content)
+                clean = re.sub(r'<(?:head|title|meta|link|style|script)[^>]*>.*?</(?:head|title|meta|link|style|script)>', '', content, flags=re.DOTALL | re.IGNORECASE)
+                clean = re.sub(r'<[^>]+>', ' ', clean)
+                return html.unescape(clean).strip()
+        return html.unescape(content).strip()
+
+    @classmethod
+    def extract_text_outside_media(cls, content: str) -> str:
+        """Extracts translatable text excluding metadata tags AND media elements."""
+        if not content:
+            return ""
+        if '<' in content:
+            try:
+                soup = BeautifulSoup(content, 'html.parser')
+                for tag in soup.find_all(list(cls.IGNORED_TEXT_TAGS)):
+                    tag.decompose()
+                for tag in soup.find_all(list(cls.MEDIA_TAGS)):
+                    tag.decompose()
+                text = soup.get_text(separator=' ', strip=True)
                 return html.unescape(text).strip()
+            except Exception:
+                clean = re.sub(r'<(?:head|title|meta|link|style|script|svg|figure)[^>]*>.*?</(?:head|title|meta|link|style|script|svg|figure)>', '', content, flags=re.DOTALL | re.IGNORECASE)
+                clean = re.sub(r'<[^>]+>', ' ', clean)
+                return html.unescape(clean).strip()
         return html.unescape(content).strip()
 
     @classmethod
     def has_meaningful_text(cls, content: str, min_len: int = 1) -> bool:
-        """Returns True if content contains meaningful non-whitespace text of at least min_len chars."""
-        return len(cls.extract_pure_text(content)) >= min_len
+        """Returns True if content contains meaningful non-whitespace text outside media tags."""
+        return len(cls.extract_text_outside_media(content)) >= min_len
 
     @classmethod
     def has_media_tags(cls, content: str) -> bool:
-        """Checks if content contains media elements like img, svg, image, picture, video, audio."""
+        """Checks if content contains media elements like img, svg, image, picture, figure, etc."""
         if not content:
             return False
         return bool(cls.MEDIA_TAG_PATTERN.search(content))
 
     @classmethod
     def is_media_only_chunk(cls, content: str) -> bool:
-        """Returns True if chunk has media tags but no meaningful text."""
+        """Returns True if chunk has media tags/wrappers but no meaningful translatable text."""
         return cls.has_media_tags(content) and not cls.has_meaningful_text(content)
 
     @classmethod
     def is_empty_chunk(cls, content: str) -> bool:
-        """Returns True if chunk has neither text nor media tags."""
+        """Returns True if chunk has neither meaningful text nor media tags."""
         return not cls.has_meaningful_text(content) and not cls.has_media_tags(content)
 
     def split_chunk_binary(self, chunk_text: str) -> List[str]:
