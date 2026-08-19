@@ -31,11 +31,14 @@ from domain.chunkers.base_chunker import BaseChunker
 from domain.chunkers.dom_chunker import DomChunker, EpubDomChunker
 from domain.chunkers.plain_text_chunker import PlainTextChunker, TxtChunker
 from domain.glossary.extractor import GlossaryExtractor
+from domain.glossary.matcher import GlossaryMatcher
 from domain.glossary.injector import GlossaryInjector
 from domain.postprocess.cleaner import TextCleaner
 from domain.postprocess.quality_checker import QualityChecker
 from domain.postprocess.tag_masker import TagMasker
+from domain.postprocess.glossary_corrector import GlossaryCorrector
 from ui.signals import TranslationSignals
+
 
 logger = setup_logger("Orchestrator")
 
@@ -214,9 +217,9 @@ class TranslationOrchestrator(QtCore.QObject):
                 if self.cancel_requested:
                     return text_chunk
 
-                # 3. Dynamic Glossary Injection on masked text
+                # 3. Dynamic Glossary Injection on masked text (NFKC normalized, Longest Match First)
                 glossary_context = GlossaryInjector.inject_glossary_context(
-                    masked_text, glossary_entries, enabled=use_glossary
+                    masked_text, glossary_entries, enabled=use_glossary, lang_code=language
                 )
                 prompt_template = profile.get_prompt_template(is_epub=is_epub)
                 prompt_str = prompt_template.replace("{{slot}}", masked_text).replace("{{glossary_context}}", glossary_context)
@@ -297,8 +300,18 @@ class TranslationOrchestrator(QtCore.QObject):
                     )
                     used_fallback = True
 
+                # 4.5. Glossary Post-Correction & Korean Josa Repair
+                if glossary_entries and use_glossary:
+                    translated_masked = GlossaryCorrector.correct_text(
+                        source_text=masked_text,
+                        translated_text=translated_masked,
+                        glossary_entries=glossary_entries,
+                        lang_code=language
+                    )
+
                 # 5. Tag Unmasking: Restore [TAG_N] placeholders back to original HTML tags
                 final_translated = TagMasker.unmask_tags(translated_masked, tag_map)
+
 
                 if not is_epub:
                     final_translated = TextCleaner.strip_html_tags(final_translated)

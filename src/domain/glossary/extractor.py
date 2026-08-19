@@ -6,6 +6,7 @@ real-time atomic checkpointing, and resume support.
 
 import json
 import re
+import unicodedata
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Callable
 from google.genai import types as genai_types
@@ -41,12 +42,24 @@ class GlossaryExtractor:
     )
 
     LANG_RULES = {
-        "ZH": "1. 일반 인명은 중국어 병음의 한글 표기(음역)를 따르고(예: 첸링, 구쥔), 지명/문파/세력/기술/크툴루·SF 설정은 한국식 한자 독음(음차)을 준수하십시오(예: 황혼사, 계역, 천기국).\n"
-              "2. 외래어 브랜드/국가명은 표준 외래어 표기법을 준수하십시오(예: 巴西 -> 브라질, 宝马 -> BMW).",
+        "ZH": (
+            "1. [인명 표기 절대 원칙 - 중국어 현지 발음(병음 음역) 기준]: "
+            "중국 소설 인명 및 등장인물 고유명사는 절대로 한국식 한자 독음(Hanja-eum, 예: 钟九->종구 X, 张小华->장소화 X, 萧炎->소염 X, 林动->임동 X, 顾夜白->고야백 X)으로 변환하지 마십시오. "
+            "반드시 표준 중국어 외래어 표기법 및 병음 발음(Pinyin Transliteration) 음역을 최우선 원칙으로 적용하십시오.\n"
+            "   * 표준 음역 예시: 钟九 -> 종지우, 张小华 -> 장샤오화, 萧炎 -> 샤오옌, 林动 -> 린둥, 顾夜白 -> 구예바이, 楚风 -> 추펑, 叶修 -> 예슈, 唐三 -> 탕싼\n"
+            "2. [인명 호칭 분리 원칙]: "
+            "인물 이름 뒤나 앞에 붙는 호칭(哥, 姐, 师兄, 师姐, 师弟, 师妹, 叔, 伯, 爷, 弟, 妹, 宗主, 掌门, 前辈, 先生, 小姐 등)은 분리하여 '이름 본체'만 추출하십시오. "
+            "(예: '钟九哥' -> keyword: '钟九', translated_keyword: '종지우', category: '인명')\n"
+            "3. [지명/문파/세력/무공/아이템/설정]: "
+            "지명, 문파, 세력, 무공, 도구, 크툴루/선협/SF 설정 등은 한국식 한자 독음(음차) 또는 장르 관례에 맞는 한국어 용어를 준수하십시오 (예: 황혼사, 계역, 천기국, 화산파, 벽력탄).\n"
+            "4. [외래어/브랜드]: "
+            "외래어 브랜드 및 국가명은 표준 외래어 표기법을 준수하십시오 (예: 巴西 -> 브라질, 宝马 -> BMW)."
+        ),
         "JA": "1. 일본어 라이트노벨 인명, 지명, 루비 표기, 호칭(군, 양, 씨 등)을 한국 공식 발매본 형식으로 자연스럽게 번역/음역하십시오.\n"
               "2. 한자 고유명사와 가타카나 외래어 표기법을 정확히 적용하십시오.",
         "EN": "1. 영어 인명, 지명, 판타지/SF 고유명사는 국립국어원 외래어 표기법에 맞춰 한글로 자연스럽게 음역하십시오."
     }
+
 
     @classmethod
     def get_tmp_checkpoint_path(cls, file_path: Path) -> Path:
@@ -176,6 +189,26 @@ class GlossaryExtractor:
         return results
 
     @classmethod
+    def _clean_extracted_term(cls, kw: str, tr: str, cat: str, lang_code: str) -> tuple[str, str, str]:
+        """Cleans and standardizes extracted terms (NFKC normalization, Chinese honorific stripping)."""
+        kw = unicodedata.normalize('NFKC', kw).strip()
+        tr = unicodedata.normalize('NFKC', tr).strip()
+        cat = cat.strip() if cat else "고유명사"
+
+        if lang_code.upper() == "ZH" and cat in ("인명", "등장인물", "인물", "고유명사"):
+            honorific_suffixes = (
+                '师兄', '师姐', '师弟', '师妹', '宗主', '掌门', '前辈', '先生', '小姐',
+                '大哥', '小哥', '大姐', '小妹', '老弟', '老哥', '老祖', '道友', '道长',
+                '师尊', '阁下', '大人', '陛下', '殿下', '哥', '姐', '叔', '伯', '爷', '弟', '妹'
+            )
+            for suffix in honorific_suffixes:
+                if kw.endswith(suffix) and len(kw) - len(suffix) >= 2:
+                    kw = kw[:-len(suffix)].strip()
+                    break
+
+        return kw, tr, cat
+
+    @classmethod
     async def extract_glossary_from_file_async(
         cls,
         gemini_client: Any,
@@ -271,9 +304,10 @@ class GlossaryExtractor:
 
                 # Reduce / Merge into merged_glossary
                 for item in extracted_items:
-                    kw = str(item.get("keyword", "")).strip()
-                    tr = str(item.get("translated_keyword", "")).strip()
-                    cat = str(item.get("category", "고유명사")).strip() or "고유명사"
+                    raw_kw = str(item.get("keyword", "")).strip()
+                    raw_tr = str(item.get("translated_keyword", "")).strip()
+                    raw_cat = str(item.get("category", "고유명사")).strip() or "고유명사"
+                    kw, tr, cat = cls._clean_extracted_term(raw_kw, raw_tr, raw_cat, lang_code)
                     raw_cnt = item.get("occurrence_count", 1)
                     cnt = int(raw_cnt) if str(raw_cnt).isdigit() and int(raw_cnt) > 0 else 1
 
