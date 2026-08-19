@@ -49,13 +49,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._init_ui()
         self._wire_signals()
         
-        # Initialize title badge with configured default language
-        default_lang = self.config.get("default_language", "JA")
-        self.lang_toggle.set_selected_language(default_lang)
-        self._update_title_badge(default_lang)
+        # Initialize active source language from config
+        self.current_source_lang = self.config.get("source_lang", self.config.get("default_language", "JA")).upper()
+        self.lang_toggle.set_selected_language(self.current_source_lang)
+        self._update_title_badge(self.current_source_lang)
 
         # Check API Keys on startup
         QtCore.QTimer.singleShot(500, self._check_initial_api_keys)
+
 
     def _check_initial_api_keys(self):
         """Displays startup warning if API keys are missing."""
@@ -170,7 +171,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.signals.glossary_loading.connect(self.glossary_table.set_loading)
         self.signals.glossary_completed.connect(self._on_glossary_completed)
         self.glossary_table.extract_requested.connect(self._trigger_glossary_extraction)
-        self.lang_toggle.language_changed.connect(self._update_title_badge)
+        self.lang_toggle.language_changed.connect(self._on_language_toggled)
+
+    def _on_language_toggled(self, lang_code: str):
+        """Synchronizes source language toggle with internal state and config.json immediately."""
+        self.current_source_lang = lang_code.upper()
+        self._update_title_badge(self.current_source_lang)
+        self.config["source_lang"] = self.current_source_lang
+        self.config["default_language"] = self.current_source_lang
+        ConfigLoader.save_config(self.config)
+        self.orchestrator.config = self.config
+        logger.info(f"Language switched to {self.current_source_lang} and saved to config.")
 
     def _browse_file(self):
         file_path, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -229,7 +240,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._open_settings()
             return
 
-        lang = self.lang_toggle.get_selected_language()
+        lang = self.current_source_lang
         self.tabs.setCurrentIndex(1)  # Switch to Glossary Tab
 
         if self.loop:
@@ -239,14 +250,21 @@ class MainWindow(QtWidgets.QMainWindow):
             )
 
     def _open_settings(self):
-        dialog = SettingsDialog(self)
-        dialog.load_settings()
+        dialog = SettingsDialog(parent=self, current_lang=self.current_source_lang)
+        dialog.load_settings(current_lang=self.current_source_lang)
         if dialog.exec() == QtWidgets.QDialog.Accepted:
             self.config = ConfigLoader.load_or_init_config()
             self.orchestrator.key_manager.set_api_keys(self.config.get("api_keys", []))
             self.orchestrator.key_manager.set_request_delay(self.config.get("request_delay", 0.5))
             self.orchestrator.config = self.config
-            logger.info("Settings updated and applied runtime.")
+
+            saved_lang = self.config.get("source_lang", self.config.get("default_language", self.current_source_lang))
+            if saved_lang and saved_lang.upper() != self.current_source_lang:
+                self.current_source_lang = saved_lang.upper()
+                self.lang_toggle.set_selected_language(self.current_source_lang)
+
+            self._update_title_badge(self.current_source_lang)
+            logger.info(f"Settings updated and applied runtime for {self.current_source_lang}.")
 
     def _start_translation(self):
         in_path = self.input_edit.text().strip()
@@ -272,7 +290,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pause_btn.setEnabled(True)
         self.cancel_btn.setEnabled(True)
 
-        lang = self.lang_toggle.get_selected_language()
+        lang = self.current_source_lang
         
         if self.loop:
             asyncio.run_coroutine_threadsafe(
@@ -284,6 +302,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 ),
                 self.loop
             )
+
 
     def _pause_translation(self):
         if self.orchestrator.is_paused:

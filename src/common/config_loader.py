@@ -20,6 +20,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "temperature": 0.7,
     "top_p": 0.9,
     "thinking_level": "high",
+    "source_lang": "JA",
     "default_language": "JA",
     "max_workers": 4,
     "rpm_limit": 60,

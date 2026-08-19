@@ -3,6 +3,7 @@ OmniTranslator Pro - Seamarine-Style Quick Settings Modal Dialog
 Supports General Settings and Prompt/Prefill Management tabs.
 """
 
+import re
 from PySide6 import QtWidgets, QtCore
 from common.config_loader import ConfigLoader
 from common.logger import setup_logger
@@ -13,6 +14,7 @@ from domain.profiles.en_profile import DEFAULT_SYSTEM_PROMPT as EN_DEFAULT
 
 logger = setup_logger("SettingsDialog")
 
+
 class SettingsDialog(QtWidgets.QDialog):
     """Quick settings modal popup window with TabWidget."""
 
@@ -22,20 +24,21 @@ class SettingsDialog(QtWidgets.QDialog):
         "EN": EN_DEFAULT
     }
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, current_lang: str = "JA"):
         super().__init__(parent)
         self.setWindowTitle("⚙️ 빠른 번역 설정 (Quick Settings)")
         self.resize(600, 600)
         
+        self.current_prompt_lang = current_lang.upper() if current_lang else "JA"
         self.prompts_data = {
             "JA": {"system_prompt": JA_DEFAULT, "custom_rules": ""},
             "ZH": {"system_prompt": ZH_DEFAULT, "custom_rules": ""},
             "EN": {"system_prompt": EN_DEFAULT, "custom_rules": ""}
         }
-        self.current_prompt_lang = "JA"
 
         self._init_ui()
-        self._load_config()
+        self._load_config(current_lang=self.current_prompt_lang)
+
 
     def _init_ui(self):
         main_layout = QtWidgets.QVBoxLayout(self)
@@ -185,9 +188,9 @@ class SettingsDialog(QtWidgets.QDialog):
             combo.addItem(cleaned)
             combo.setCurrentText(cleaned)
 
-    def load_settings(self):
+    def load_settings(self, current_lang: str = None):
         """Public alias to reload latest settings from ConfigLoader."""
-        self._load_config()
+        self._load_config(current_lang=current_lang)
 
     def _refresh_models(self):
         typed_keys = [k.strip() for k in self.api_keys_text.toPlainText().splitlines() if k.strip()]
@@ -233,21 +236,36 @@ class SettingsDialog(QtWidgets.QDialog):
 
     def _on_prompt_lang_changed(self, index: int):
         self._sync_current_prompt_ui_to_memory()
-        self.current_prompt_lang = self.prompt_lang_combo.currentData()
-        self._load_prompt_memory_to_ui()
+        selected_lang = self.prompt_lang_combo.currentData()
+        if selected_lang:
+            self.current_prompt_lang = selected_lang
+            self._load_prompt_memory_to_ui()
+
+    @staticmethod
+    def _clean_custom_rules_text(text: str) -> str:
+        """Strips any internal/legacy prefixes such as 'ZH CUSTOM RULE:', 'JA CUSTOM RULE:' from custom rules."""
+        if not text:
+            return ""
+        cleaned = re.sub(
+            r'^(?:\[\s*)?(?:ZH|JA|EN)\s*(?:CUSTOM\s*RULES?|커스텀\s*규칙)(?:\s*\])?\s*:\s*',
+            '',
+            text.strip(),
+            flags=re.IGNORECASE
+        )
+        return cleaned.strip()
 
     def _sync_current_prompt_ui_to_memory(self):
         lang = self.current_prompt_lang
         self.prompts_data[lang] = {
             "system_prompt": self.sys_prompt_edit.toPlainText().strip(),
-            "custom_rules": self.custom_rules_edit.toPlainText().strip()
+            "custom_rules": self._clean_custom_rules_text(self.custom_rules_edit.toPlainText())
         }
 
     def _load_prompt_memory_to_ui(self):
         lang = self.current_prompt_lang
         data = self.prompts_data.get(lang, {})
         self.sys_prompt_edit.setPlainText(data.get("system_prompt", self.DEFAULTS.get(lang, "")))
-        self.custom_rules_edit.setPlainText(data.get("custom_rules", ""))
+        self.custom_rules_edit.setPlainText(self._clean_custom_rules_text(data.get("custom_rules", "")))
 
     def _reset_current_prompt(self):
         lang = self.current_prompt_lang
@@ -256,8 +274,13 @@ class SettingsDialog(QtWidgets.QDialog):
         self.custom_rules_edit.clear()
         self._sync_current_prompt_ui_to_memory()
 
-    def _load_config(self):
+    def _load_config(self, current_lang: str = None):
         cfg = ConfigLoader.load_or_init_config()
+        if current_lang:
+            self.current_prompt_lang = current_lang.upper()
+        else:
+            self.current_prompt_lang = cfg.get("source_lang", cfg.get("default_language", "JA")).upper()
+
         keys = cfg.get("api_keys", [])
         self.api_keys_text.setPlainText("\n".join(keys))
         
@@ -279,11 +302,26 @@ class SettingsDialog(QtWidgets.QDialog):
 
         saved_prompts = cfg.get("prompts", {})
         for l_code in ["JA", "ZH", "EN"]:
-            if l_code in saved_prompts:
+            if l_code in saved_prompts and isinstance(saved_prompts[l_code], dict):
+                raw_rules = saved_prompts[l_code].get("custom_rules", "")
                 self.prompts_data[l_code] = {
                     "system_prompt": saved_prompts[l_code].get("system_prompt", self.DEFAULTS[l_code]),
-                    "custom_rules": saved_prompts[l_code].get("custom_rules", "")
+                    "custom_rules": self._clean_custom_rules_text(raw_rules)
                 }
+            else:
+                self.prompts_data[l_code] = {
+                    "system_prompt": self.DEFAULTS[l_code],
+                    "custom_rules": ""
+                }
+
+
+        # Set prompt combobox to currently active language
+        idx = self.prompt_lang_combo.findData(self.current_prompt_lang)
+        if idx >= 0:
+            self.prompt_lang_combo.blockSignals(True)
+            self.prompt_lang_combo.setCurrentIndex(idx)
+            self.prompt_lang_combo.blockSignals(False)
+
         self._load_prompt_memory_to_ui()
 
     def _save_config(self):
@@ -293,7 +331,8 @@ class SettingsDialog(QtWidgets.QDialog):
         trans_model = self.trans_model_combo.currentText().replace("models/", "").strip()
         gloss_model = self.glossary_model_combo.currentText().replace("models/", "").strip()
         
-        cfg = {
+        cfg = ConfigLoader.load_or_init_config()
+        cfg.update({
             "api_keys": keys,
             "translation_model": trans_model,
             "glossary_model": gloss_model,
@@ -305,8 +344,15 @@ class SettingsDialog(QtWidgets.QDialog):
             "use_dynamic_glossary": self.use_dynamic_glossary_check.isChecked(),
             "enable_prefill": self.prefill_check.isChecked(),
             "prefill_text": self.prefill_text_edit.toPlainText().strip(),
-            "prompts": self.prompts_data
-        }
+            "source_lang": self.current_prompt_lang,
+            "default_language": self.current_prompt_lang,
+            "prompts": {
+                "JA": self.prompts_data.get("JA", {"system_prompt": self.DEFAULTS["JA"], "custom_rules": ""}),
+                "ZH": self.prompts_data.get("ZH", {"system_prompt": self.DEFAULTS["ZH"], "custom_rules": ""}),
+                "EN": self.prompts_data.get("EN", {"system_prompt": self.DEFAULTS["EN"], "custom_rules": ""})
+            }
+        })
         ConfigLoader.save_config(cfg)
-        logger.info(f"Settings saved successfully. translation_model='{trans_model}', glossary_model='{gloss_model}'")
+        logger.info(f"Settings saved successfully. source_lang='{self.current_prompt_lang}', translation_model='{trans_model}', glossary_model='{gloss_model}'")
         self.accept()
+
