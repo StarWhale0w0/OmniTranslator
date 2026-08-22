@@ -17,8 +17,8 @@ class GeminiClient:
     """High-level async Gemini client wrapping SDK calls, key rotation, model discovery, and safety bypass."""
 
     DEFAULT_FALLBACK_MODELS = [
+        "gemini-3.1-pro-preview",
         "gemini-2.5-flash",
-        "gemini-3-pro-preview",
         "gemini-2.0-flash",
         "gemini-2.0-pro"
     ]
@@ -199,7 +199,7 @@ class GeminiClient:
     async def generate_text_async(
         self,
         prompt_contents: List[genai_types.Content],
-        model_name: str = "gemini-2.5-flash",
+        model_name: str = "gemini-3.1-pro-preview",
         temperature: float = 0.7,
         top_p: float = 0.9,
         thinking_budget: Optional[int] = None,
@@ -208,12 +208,13 @@ class GeminiClient:
     ) -> str:
         """
         Performs async text generation with standard safety settings (BLOCK_NONE),
-        direct candidate parts extraction, finish_reason detection, and instant escape on PROMPT_BLOCKED.
+        automatic key rotation failover across all keys, backoff retry (min 3-5 times),
+        and prompt relaxation on blocks.
         """
-        max_retries = max(len(self.key_manager.api_keys) * 2, 4)
+        num_keys = max(1, self.key_manager.get_key_count())
+        max_retries = max(num_keys * 3, 5)
         current_system_instruction = system_instruction
         last_error_reason = "Unknown error"
-        prompt_blocked_count = 0
 
         for attempt in range(max_retries):
             api_key = self.key_manager.get_active_key()
@@ -255,84 +256,50 @@ class GeminiClient:
 
                 # Handle empty response with specific finish reason diagnostics
                 block_info_str = f" [Detail: {block_detail}]" if block_detail else ""
+                last_error_reason = f"finish_reason={finish_reason}{block_info_str}"
                 logger.warning(
-                    f"Gemini API returned empty text (Attempt {attempt+1}/{max_retries}). "
-                    f"finish_reason: {finish_reason}{block_info_str}"
+                    f"Gemini API returned empty text (Attempt {attempt+1}/{max_retries}, key ...{api_key[-6:]}). "
+                    f"{last_error_reason}"
                 )
 
-                # 1. Special Handling: PROMPT_BLOCKED (Input prompt level safety block)
-                if finish_reason == "PROMPT_BLOCKED" or (block_detail and "PROMPT_BLOCKED" in block_detail):
-                    prompt_blocked_count += 1
-                    logger.warning(
-                        f"[PROMPT_BLOCKED 감지] Gemini API 입력 프롬프트 차단 ({block_detail or finish_reason}). "
-                        f"시도: {prompt_blocked_count}/2"
-                    )
-                    
-                    if prompt_blocked_count >= 2 or attempt >= 1:
-                        logger.warning(
-                            "[PROMPT_BLOCKED 즉시 탈출] 재시도 후 차단 지속 -> 무한 재시도 중단 및 원문 즉시 반환."
-                        )
-                        if raw_fallback_text is not None:
-                            return raw_fallback_text
-                        raise RuntimeError(f"PROMPT_BLOCKED: {block_detail or finish_reason}")
-
-                    # 1회 완화 재시도: 가상 창작물 지침 추가
+                # Context Relaxation on Prompt/Candidate level block
+                if finish_reason in ["PROMPT_BLOCKED", "SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII"] or (block_detail and "BLOCKED" in block_detail.upper()):
                     if self.CONTEXT_RELAXATION_PROMPT not in (current_system_instruction or ""):
                         current_system_instruction = (current_system_instruction or "") + self.CONTEXT_RELAXATION_PROMPT
-                    await asyncio.sleep(0.5)
-                    continue
 
-                # 2. Response Candidate Level Safety Block (SAFETY, RECITATION, etc.)
-                if finish_reason in ["SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII"]:
-                    last_error_reason = f"Safety Block ({finish_reason}{block_info_str})"
-                    logger.warning(
-                        f"Safety block detected ({finish_reason}). Appending context relaxation instruction and retrying..."
-                    )
-                    if self.CONTEXT_RELAXATION_PROMPT not in (current_system_instruction or ""):
-                        current_system_instruction = (current_system_instruction or "") + self.CONTEXT_RELAXATION_PROMPT
-                    
-                    # If blocked again after relaxation attempt
-                    if attempt >= 1 and raw_fallback_text is not None:
-                        logger.warning(
-                            f"[SAFETY BLOCK 즉시 탈출] 완화 지침 적용 후에도 {finish_reason} 지속 -> 무한 재시도 방지를 위해 원문 반환."
-                        )
-                        return raw_fallback_text
-                else:
-                    last_error_reason = f"Empty response (finish_reason={finish_reason})"
-
-                # Rotate key and retry with slight delay
-                await asyncio.sleep(1.0 * (attempt + 1))
+                # Rotate key and apply backoff retry
+                if attempt < max_retries - 1:
+                    self.key_manager.rotate_key(api_key, is_rate_limit=False, cooldown_seconds=15.0)
+                    await asyncio.sleep(min(1.0 * (attempt + 1), 4.0))
 
             except Exception as e:
                 detailed_err = self.format_api_error_detail(e)
                 last_error_reason = detailed_err
-                logger.error(
-                    f"Gemini API call failed (Attempt {attempt+1}/{max_retries}) "
-                    f"using key (...{api_key[-6:]}): {detailed_err}"
+                err_upper = detailed_err.upper()
+
+                is_rate_limit = any(k in err_upper for k in ["429", "QUOTA", "RESOURCE_EXHAUSTED", "TOO_MANY_REQUESTS"])
+                is_transient = any(k in err_upper for k in ["503", "500", "502", "504", "UNAVAILABLE", "DEADLINE_EXCEEDED", "TIMEOUT", "CONNECTION", "OVERLOADED"])
+
+                logger.warning(
+                    f"Gemini API error (Attempt {attempt+1}/{max_retries}) on key (...{api_key[-6:]}): {detailed_err}. "
+                    f"Rotating key and retrying with backoff..."
                 )
-                
-                # Check for prompt blocked in exception message
-                if "PROMPT_BLOCKED" in detailed_err or "prompt was blocked" in detailed_err.lower():
-                    prompt_blocked_count += 1
-                    if prompt_blocked_count >= 2 or attempt >= 1:
-                        logger.warning("[PROMPT_BLOCKED 예외 탈출] 무한 재시도 중단 및 원문 반환.")
-                        if raw_fallback_text is not None:
-                            return raw_fallback_text
-                        raise RuntimeError(f"PROMPT_BLOCKED: {detailed_err}")
 
                 if "400" in detailed_err or "INVALID_ARGUMENT" in detailed_err:
-                    logger.error(
-                        f"[400 INVALID_ARGUMENT] Gemini API 매개변수 오류 상세: {detailed_err}"
-                    )
+                    logger.error(f"[400 INVALID_ARGUMENT] Gemini API 매개변수 오류 상세: {detailed_err}")
 
-                if "429" in detailed_err or "QUOTA" in detailed_err or "RESOURCE_EXHAUSTED" in detailed_err:
-                    self.key_manager.mark_key_failed(api_key, is_rate_limit=True)
-                else:
-                    await asyncio.sleep(1.5 * (attempt + 1))
+                # Rotate failing key into cooldown
+                if attempt < max_retries - 1:
+                    cd = 60.0 if is_rate_limit else (15.0 if is_transient else 10.0)
+                    self.key_manager.rotate_key(api_key, is_rate_limit=is_rate_limit, cooldown_seconds=cd)
+                    backoff = min(1.5 * (attempt + 1), 5.0)
+                    await asyncio.sleep(backoff)
 
-        # If all retries exhausted, preserve raw text fallback if available
+        # If all retries across all keys exhausted
+        logger.warning(
+            f"All {max_retries} Gemini retries across all API keys exhausted. Last error: {last_error_reason}"
+        )
         if raw_fallback_text is not None:
-            logger.warning(f"All retries exhausted ({last_error_reason}). Preserving original text to avoid job failure.")
             return raw_fallback_text
 
-        raise RuntimeError(f"Failed to generate content after exhausting retries: {last_error_reason}")
+        raise RuntimeError(f"Failed to generate content after exhausting all Gemini keys: {last_error_reason}")

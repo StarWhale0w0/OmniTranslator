@@ -49,7 +49,7 @@ EPUB과 TXT 문서를 완벽 지원하며, 다중 API 키 로테이션과 지능
 ## 🛠️ 기술 스택 (Tech Stack)
 
 * **GUI Framework:** Python 3.12, PySide6 (Qt for Python), qasync
-* **LLM Engine:** Google GenAI SDK (`gemini-2.5-flash`, `gemini-3-flash-preview` 등)
+* **LLM Engine:** Google GenAI SDK (`gemini-2.5-flash`, `gemini-3.1-pro-preview` 등)
 * **Document Processing:** ebooklib, BeautifulSoup4, lxml
 * **Packaging:** PyInstaller (Standalone Windows Executable)
 

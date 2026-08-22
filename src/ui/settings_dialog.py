@@ -284,8 +284,8 @@ class SettingsDialog(QtWidgets.QDialog):
         keys = cfg.get("api_keys", [])
         self.api_keys_text.setPlainText("\n".join(keys))
         
-        trans_model = cfg.get("translation_model", "gemini-2.5-flash")
-        gloss_model = cfg.get("glossary_model", "gemini-2.5-flash")
+        trans_model = cfg.get("translation_model", "gemini-3.1-pro-preview")
+        gloss_model = cfg.get("glossary_model", "gemini-3.1-pro-preview")
 
         self._set_combo_model(self.trans_model_combo, trans_model)
         self._set_combo_model(self.glossary_model_combo, gloss_model)

@@ -133,6 +133,32 @@ class QualityChecker:
                 "issue": issue
             }
 
+        # 3.5. Unmasked [TAG_N] Placeholder Corruption Check
+        if re.search(r'\[\s*TAG\s*_?\s*\d+\s*\]', translated_text, re.IGNORECASE):
+            issue = "TAG_UNMASK_CORRUPTED (잔여 [TAG_N] 플레이스홀더 감지)"
+            logger.warning(f"Quality Check Alert: {issue}")
+            return {
+                "is_suspicious": True,
+                "is_content_drop": False,
+                "is_repetition": False,
+                "is_tag_corrupted": True,
+                "ratio": trans_len / src_len if src_len > 0 else 0.0,
+                "issue": issue
+            }
+
+        # 3.6. LLM Thinking / Meta monologue leak check
+        if re.search(r'(?:Ah[!,.]?\s*I\s*see|Final\s*Polish\s*of\s*Korean|Ready\s*to\s*output|The\s*prompt\s*got\s*cut\s*off|<think|<thought)', translated_text, re.IGNORECASE):
+            issue = "THINKING_LEAK_DETECTED (LLM Thinking 메타 텍스트 유출 감지)"
+            logger.warning(f"Quality Check Alert: {issue}")
+            return {
+                "is_suspicious": True,
+                "is_content_drop": False,
+                "is_repetition": False,
+                "is_thinking_leak": True,
+                "ratio": trans_len / src_len if src_len > 0 else 0.0,
+                "issue": issue
+            }
+
         # 4. Length Ratio Anomaly
         ratio = trans_len / src_len if src_len > 0 else 1.0
         is_suspicious = False

@@ -15,8 +15,8 @@ logger = setup_logger("ConfigLoader")
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "api_keys": [],
-    "translation_model": "gemini-2.5-flash",
-    "glossary_model": "gemini-2.5-flash",
+    "translation_model": "gemini-3.1-pro-preview",
+    "glossary_model": "gemini-3.1-pro-preview",
     "temperature": 0.7,
     "top_p": 0.9,
     "thinking_level": "high",

@@ -93,7 +93,7 @@ class TranslationOrchestrator(QtCore.QObject):
         self.signals.log_emitted.emit("INFO", f"AI 전수 용어 추출 시작: {input_path.name}")
 
         try:
-            gloss_model = self.config.get("glossary_model", "gemini-2.5-flash")
+            gloss_model = self.config.get("glossary_model", "gemini-3.1-pro-preview")
 
             def on_progress(block_idx: int, total_blocks: int, terms_count: int):
                 msg = f"[용어집 분석 중] 블록 {block_idx} / {total_blocks} 완료 (현재 수집된 고유명사: {terms_count}개)..."
@@ -184,15 +184,27 @@ class TranslationOrchestrator(QtCore.QObject):
         start_time = time.time()
         max_workers = self.config.get("max_workers", 4)
         semaphore = asyncio.Semaphore(max_workers)
-        trans_model = self.config.get("translation_model", "gemini-2.5-flash")
+        trans_model = self.config.get("translation_model", "gemini-3.1-pro-preview")
         use_glossary = self.config.get("use_dynamic_glossary", True)
         prefill_text = self.config.get("prefill_text", "").strip()
         configured_chunk_size = self.config.get("chunk_size", 2000)
 
-        # Helper: Async single chunk translation with SeaMarine Tag Masking & GoogleTranslator Fallback
+        # Helper: Async single chunk translation with SeaMarine Tag Masking & Multi-Key Failover
         async def translate_single_chunk(idx: int, text_chunk: str) -> str:
             if idx in translated_dict:
-                return translated_dict[idx]
+                cached_text = translated_dict[idx]
+                is_valid, reason = SessionManager.is_chunk_valid(cached_text)
+                if is_valid:
+                    return cached_text
+                else:
+                    logger.warning(
+                        f"Chunk #{idx+1}: 기존 캐시/체크포인트 오염 감지 ({reason}) -> Gemini 재번역 대상으로 초기화"
+                    )
+                    self.signals.log_emitted.emit(
+                        "WARNING",
+                        f"Chunk #{idx+1}: [오염 복구] 이전 체크포인트 정합성 실패 ({reason}) -> Gemini 재번역 시작"
+                    )
+                    del translated_dict[idx]
 
             # 1. Tag Masking: Isolate HTML/XML/Media tags into [TAG_N] placeholders
             masked_text, tag_map, pure_text = TagMasker.mask_tags(text_chunk)
@@ -241,64 +253,117 @@ class TranslationOrchestrator(QtCore.QObject):
                 )
 
                 translated_masked = ""
-                used_fallback = False
+                gemini_success = False
+                current_sys_instruction = final_system_instruction
+                max_gemini_qc_retries = 4
 
-                # 4. Primary Translation: Gemini API
-                try:
-                    init_temp = self.config.get("temperature", 0.3)
-                    result_raw = await self.gemini_client.generate_text_async(
-                        prompt_contents=prompt_contents,
-                        model_name=trans_model,
-                        temperature=init_temp,
-                        top_p=self.config.get("top_p", 0.9),
-                        thinking_budget=None,
-                        system_instruction=final_system_instruction,
-                        raw_fallback_text=masked_text
-                    )
+                # 4. Primary Translation: Gemini API with Quality-Check Retry & Key Failover Loop
+                for gemini_att in range(max_gemini_qc_retries):
+                    try:
+                        init_temp = self.config.get("temperature", 0.3)
+                        result_raw = await self.gemini_client.generate_text_async(
+                            prompt_contents=prompt_contents,
+                            model_name=trans_model,
+                            temperature=init_temp,
+                            top_p=self.config.get("top_p", 0.9),
+                            thinking_budget=None,
+                            system_instruction=current_sys_instruction,
+                            raw_fallback_text=masked_text
+                        )
 
-                    # Check if Gemini blocked or returned raw fallback
-                    if result_raw == masked_text or not result_raw.strip():
-                        logger.warning(
-                            f"Chunk #{idx+1}: Gemini 차단 또는 빈 응답 -> 2차 폴백(GoogleTranslator) 즉시 가동."
-                        )
-                        self.signals.log_emitted.emit(
-                            "WARNING",
-                            f"Chunk #{idx+1}: [2차 폴백 가동] Gemini 차단 감지 -> GoogleTranslator로 즉시 번역 전환"
-                        )
-                        translated_masked = await FallbackTranslator.translate_async(
-                            masked_text, source_lang=language, target_lang="KO"
-                        )
-                        used_fallback = True
-                    else:
-                        cleaned = TextCleaner.clean_text(result_raw, profile.get_cleaner_patterns())
-                        qc_result = QualityChecker.inspect_chunk(masked_text, cleaned)
-
-                        # If QualityChecker detects Content Drop or severe defect:
-                        if qc_result["is_suspicious"] and qc_result.get("is_content_drop", False):
+                        # If Gemini returned raw fallback or empty text
+                        if result_raw == masked_text or not result_raw.strip():
                             logger.warning(
-                                f"Chunk #{idx+1}: 본문 누락 감지 ({qc_result['issue']}) -> GoogleTranslator 폴백 번역 실행."
+                                f"Chunk #{idx+1}: Gemini 빈 응답/원문 반환 (시도 {gemini_att+1}/{max_gemini_qc_retries}). "
+                                f"키 교체 후 Gemini 재시도..."
+                            )
+                            if gemini_att < max_gemini_qc_retries - 1:
+                                self.key_manager.rotate_key(is_rate_limit=False, cooldown_seconds=15.0)
+                                await asyncio.sleep(1.0 * (gemini_att + 1))
+                                continue
+                            else:
+                                break
+
+                        cleaned = TextCleaner.clean_text(result_raw, profile.get_cleaner_patterns())
+                        
+                        # Pre-unmask test to inspect tag integrity
+                        test_unmasked = TagMasker.unmask_tags(cleaned, tag_map)
+                        qc_result = QualityChecker.inspect_chunk(masked_text, test_unmasked)
+
+                        # If QualityChecker detects any defect (tag corruption, thinking leak, content drop):
+                        if qc_result["is_suspicious"]:
+                            issue = qc_result.get("issue", "품질 검사 불량")
+                            logger.warning(
+                                f"Chunk #{idx+1}: Gemini 품질 검사 이상 감지 ({issue}) [시도 {gemini_att+1}/{max_gemini_qc_retries}]. "
+                                f"보정 지침 주입 및 키 교체 후 Gemini 재번역 시도..."
                             )
                             self.signals.log_emitted.emit(
                                 "WARNING",
-                                f"Chunk #{idx+1}: [본문 누락 방지] GoogleTranslator 폴백 번역 실행"
+                                f"Chunk #{idx+1}: [품질 재시도 {gemini_att+1}/{max_gemini_qc_retries}] {issue} -> 키 교체 후 Gemini 재번역"
                             )
-                            translated_masked = await FallbackTranslator.translate_async(
-                                masked_text, source_lang=language, target_lang="KO"
-                            )
-                            used_fallback = True
-                        else:
-                            translated_masked = cleaned
 
-                except Exception as e:
-                    logger.error(f"Chunk #{idx+1}: Gemini 예외 발생 ({e}) -> GoogleTranslator 2차 폴백 가동.")
+                            # Corrective Prompt Injections
+                            if qc_result.get("is_tag_corrupted", False) or "TAG" in str(issue):
+                                tag_rule = (
+                                    "\n\n[긴급 태그 보존 절대 지침]\n"
+                                    "원문의 [TAG_0], [TAG_1] 등의 플레이스홀더를 절대로 누락하거나 태그 안에 공백(예: [TAG_ 0], [TAG_1 3])을 넣지 마십시오. "
+                                    "원문 그대로의 [TAG_N] 형식을 정확하게 본문 번역문에 포함하여 출력하십시오."
+                                )
+                                if tag_rule not in current_sys_instruction:
+                                    current_sys_instruction += tag_rule
+
+                            if qc_result.get("is_thinking_leak", False) or "THINKING" in str(issue):
+                                thinking_rule = (
+                                    "\n\n[긴급 메타 텍스트 금지 절대 지침]\n"
+                                    "절대로 'Ah, I see!', 'Final Polish', 'Ready to output' 등의 영어 사고 과정이나 메타 메모를 출력하지 마십시오. "
+                                    "오직 최종 한국어 번역 텍스트만을 즉시 출력하십시오."
+                                )
+                                if thinking_rule not in current_sys_instruction:
+                                    current_sys_instruction += thinking_rule
+
+                            if qc_result.get("is_content_drop", False) or "CONTENT_DROP" in str(issue):
+                                content_rule = (
+                                    "\n\n[긴급 본문 전수 번역 지침]\n"
+                                    "원문의 모든 문장과 내용을 단 한 줄도 요약하거나 누락하지 말고 100% 완전하게 번역하십시오."
+                                )
+                                if content_rule not in current_sys_instruction:
+                                    current_sys_instruction += content_rule
+
+                            if gemini_att < max_gemini_qc_retries - 1:
+                                self.key_manager.rotate_key(is_rate_limit=False, cooldown_seconds=15.0)
+                                await asyncio.sleep(1.0 * (gemini_att + 1))
+                                continue
+                            else:
+                                break
+                        else:
+                            # Quality check passed cleanly!
+                            translated_masked = cleaned
+                            gemini_success = True
+                            break
+
+                    except Exception as e:
+                        logger.warning(
+                            f"Chunk #{idx+1}: Gemini 번역 예외 발생 ({e}) [시도 {gemini_att+1}/{max_gemini_qc_retries}]. 키 교체 후 재시도..."
+                        )
+                        if gemini_att < max_gemini_qc_retries - 1:
+                            self.key_manager.rotate_key(is_rate_limit=False, cooldown_seconds=15.0)
+                            await asyncio.sleep(1.0 * (gemini_att + 1))
+                            continue
+                        else:
+                            break
+
+                # 4.4. Extreme Fallback: Only if all Gemini retries and keys completely fail
+                if not gemini_success:
+                    logger.error(
+                        f"Chunk #{idx+1}: Gemini {max_gemini_qc_retries}회 재시도 및 키 순환 모두 실패 -> 최후 수단으로 GoogleTranslator 가동."
+                    )
                     self.signals.log_emitted.emit(
                         "WARNING",
-                        f"Chunk #{idx+1}: [2차 폴백 가동] Gemini 오류 발생으로 GoogleTranslator 번역 실행 ({e})"
+                        f"Chunk #{idx+1}: [최후 수단 폴백] Gemini {max_gemini_qc_retries}회 재시도 소진 -> GoogleTranslator 번역 실행"
                     )
                     translated_masked = await FallbackTranslator.translate_async(
                         masked_text, source_lang=language, target_lang="KO"
                     )
-                    used_fallback = True
 
                 # 4.5. Glossary Post-Correction & Korean Josa Repair
                 if glossary_entries and use_glossary:
@@ -312,7 +377,6 @@ class TranslationOrchestrator(QtCore.QObject):
                 # 5. Tag Unmasking: Restore [TAG_N] placeholders back to original HTML tags
                 final_translated = TagMasker.unmask_tags(translated_masked, tag_map)
 
-
                 if not is_epub:
                     final_translated = TextCleaner.strip_html_tags(final_translated)
 
@@ -321,11 +385,11 @@ class TranslationOrchestrator(QtCore.QObject):
                     logger.warning(f"Chunk #{idx+1}: 최종 출력 공백 -> 원문 태그 안전 보존")
                     final_translated = text_chunk
 
+                # Save pure translation output only (Zero text pollution)
                 translated_dict[idx] = final_translated
                 
-                # Update UI preview and checkpoint
-                preview_status = " [GoogleTranslator 폴백]" if used_fallback else ""
-                self.signals.preview_updated.emit(text_chunk, final_translated + preview_status)
+                # Update UI preview and checkpoint with pure translated text
+                self.signals.preview_updated.emit(text_chunk, final_translated)
                 SessionManager.save_checkpoint(input_path, output_path, language, 0, translated_dict, glossary_entries)
                 return final_translated
 

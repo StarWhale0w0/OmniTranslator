@@ -77,14 +77,89 @@ class TextCleaner:
         return "\n".join(deduped_lines)
 
     @classmethod
+    def clean_thinking_and_meta(cls, text: str) -> str:
+        """
+        Strips explicit reasoning tags (<think>...</think>) as well as untagged LLM meta thinking / monologue preambles
+        (e.g., 'Ah, I see!...', 'Final Polish of Korean Text:', 'Ready to output.', 'The prompt got cut off...').
+        """
+        if not text:
+            return ""
+
+        # 1. Remove explicit XML/HTML thinking tags
+        cleaned = re.sub(
+            r'<(?:think|thought|thinking|reflection)>[\s\S]*?</(?:think|thought|thinking|reflection)>',
+            '',
+            text,
+            flags=re.IGNORECASE
+        )
+
+        # 2. Remove multi-line untagged English thinking monologue at the beginning
+        cleaned = re.sub(
+            r'^(?:'
+            r'Ah[!,.]?\s*(?:I\s*see!?|The\s*prompt|let\s*me)?|'
+            r'Oh[!,.]?\s*(?:I\s*understand|I\s*see)?|'
+            r'Okay,\s*(?:let\'?s|I\s*will|here)|'
+            r'Let\'?s\s*(?:look|analyze|translate|carefully|review|break|check|do)|'
+            r'Wait,\s*(?:let\s*me|I\s*need)|'
+            r'Here(?:\'s|\s+is)\s+(?:the\s+)?(?:Korean\s+)?(?:translation|translated\s+text):?|'
+            r'Below\s+is\s+(?:the\s+)?(?:Korean\s+)?translation:?|'
+            r'Final\s*Polish(?:\s*of\s*Korean\s*(?:Text)?)?(?:\s*\(.*?\))?:?|'
+            r'Ready\s*to\s*output\.?:?|'
+            r'Sure!?,?\s*(?:here\s+is\s+the\s+translation)?|'
+            r'Certainly!?,?\s*(?:here\s+is\s+the\s+translation)?|'
+            r'The\s+prompt\s+got\s+cut\s+off[\s\S]*?(?:text\s+is|section):?|'
+            r'Thought\s*Process:?|Thinking\s*Process:?|Chain\s*of\s*Thought:?|'
+            r'Draft\s*(?:Translation)?:?|Step\s*\d+:?'
+            r')[\s\S]*?(?=(?:<div|<p|<span|\[TAG_|\n\n\s*[가-힣<]|\Z))',
+            '',
+            cleaned,
+            flags=re.IGNORECASE
+        )
+
+        # 3. Remove single/multi-line meta headers & monologue lines anywhere
+        meta_line_patterns = [
+            r'^\s*Ah[!,.]?\s*(?:I\s*see!?|The\s*prompt\s*got\s*cut\s*off|let\s*me\s*check).*$',
+            r'^\s*Wait,\s*(?:let\s*me\s*check|let\s*me\s*look|I\s*need).*$',
+            r'^\s*Final\s*Polish(?:\s*of\s*Korean\s*Text)?.*$',
+            r'^\s*Ready\s*to\s*output\.?.*$',
+            r'^\s*Here(?:\'s|\s+is)\s+(?:the\s+)?(?:Korean\s+)?(?:translation|translated\s+text):?.*$',
+            r'^\s*(?:Korean\s+)?Translation\s*(?:Result|Output)?:?.*$',
+            r'^\s*Translated\s+Text:?.*$',
+            r'^\s*Output:?.*$',
+            r'^\s*Notes?(?:\s*on\s*translation)?:?.*$',
+            r'^\s*Let\'?s\s*(?:check|review|verify|do\s*a\s*final\s*check).*$',
+            r'^\s*Everything\s*looks\s*good\.?.*$',
+            r'^\s*The\s+prompt\s+got\s+cut\s+off.*$',
+            r'^\s*(?:Thinking|Thought)\s*Process:?.*$',
+            r'^\s*Chain\s*of\s*Thought:?.*$'
+        ]
+        for pat in meta_line_patterns:
+            cleaned = re.sub(pat, '', cleaned, flags=re.MULTILINE | re.IGNORECASE)
+
+        # 4. Remove trailing assistant conversational sign-offs
+        cleaned = re.sub(
+            r'\n+\s*(?:'
+            r'Note:.*|'
+            r'Hope\s+this\s+helps!?.*|'
+            r'Let\s+me\s+know\s+if\s+you\s+need.*|'
+            r'This\s+concludes\s+the\s+translation.*'
+            r')\s*$',
+            '',
+            cleaned,
+            flags=re.IGNORECASE
+        )
+
+        return cleaned
+
+    @classmethod
     def clean_text(cls, text: str, extra_patterns: List[str] = None) -> str:
         if not text:
             return ""
 
         cleaned = cls.clean_html_response(text)
 
-        # 1. Remove <think>...</think>, <thought>...</thought>, <thinking>...</thinking>, <reflection>...</reflection> blocks
-        cleaned = re.sub(r'<(?:think|thought|thinking|reflection)>[\s\S]*?</(?:think|thought|thinking|reflection)>', '', cleaned, flags=re.IGNORECASE)
+        # 1. Clean explicit and untagged thinking / reasoning monologues
+        cleaned = cls.clean_thinking_and_meta(cleaned)
 
         # 2. Remove '*+ *Final check on.*?(\n|$)' and similar asterisk/bracket header lines
         cleaned = re.sub(r'\*+\s*Final check.*?(?:\n|$)', '\n', cleaned, flags=re.IGNORECASE)
@@ -97,9 +172,12 @@ class TextCleaner:
         cleaned = re.sub(r'^[^\n<]*->\s*`?[^`\n]+`?\s*\((?:Correct|Fixed|Pass|OK)\)[^\n]*$(?:\n)?', '', cleaned, flags=re.MULTILINE | re.IGNORECASE)
         cleaned = re.sub(r'->\s*`?[^`\n]+`?\s*\((?:Correct|Fixed|Pass|OK)\)', '', cleaned, flags=re.IGNORECASE)
 
-        # 5. Remove bracket/asterisk verification phrases (e.g., [검토 메모], *검토 완료*, *Self-Correction*)
+        # 5. Remove bracket/asterisk verification phrases and system pollution markers
         cleaned = re.sub(r'^\s*\[(?:Final check|검토|자가검증|자체\s*검토|체크리스트|Checklist|Review|Self-Correction).*?\]\s*$(?:\n)?', '', cleaned, flags=re.MULTILINE | re.IGNORECASE)
         cleaned = re.sub(r'^\s*\*+\s*(?:Final check|검토|체크리스트|Checklist|Self-Correction|Self-check|Verification).*?\*+\s*$(?:\n)?', '', cleaned, flags=re.MULTILINE | re.IGNORECASE)
+        
+        # 5.5. Remove system pollution tags ([구글 폴백], [2차 폴백], [Gemini 차단], [GoogleTranslator 폴백], etc.)
+        cleaned = re.sub(r'\[\s*(?:구글\s*폴백|2차\s*폴백|Gemini\s*차단|GoogleTranslator\s*폴백|본문\s*누락\s*방지|최후\s*폴백)\s*\]', '', cleaned, flags=re.IGNORECASE)
 
         # 6. Remove language-specific regex patterns (ads, headers)
         if extra_patterns:

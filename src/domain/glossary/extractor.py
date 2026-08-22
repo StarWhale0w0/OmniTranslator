@@ -221,7 +221,7 @@ class GlossaryExtractor:
         gemini_client: Any,
         file_path: Path,
         lang_code: str = "JA",
-        model_name: str = "gemini-2.5-flash",
+        model_name: str = "gemini-3.1-pro-preview",
         block_size: int = 18000,
         progress_callback: Optional[Callable[[int, int, int], None]] = None,
         resume_existing: bool = True
@@ -245,7 +245,7 @@ class GlossaryExtractor:
         gemini_client: Any,
         text_content: str,
         lang_code: str = "JA",
-        model_name: str = "gemini-2.5-flash",
+        model_name: str = "gemini-3.1-pro-preview",
         block_size: int = 18000,
         progress_callback: Optional[Callable[[int, int, int], None]] = None,
         checkpoint_path: Optional[Path] = None
@@ -386,7 +386,7 @@ class GlossaryExtractor:
         gemini_client: Any,
         text_content: str,
         lang_code: str = "JA",
-        model_name: str = "gemini-2.5-flash",
+        model_name: str = "gemini-3.1-pro-preview",
         progress_callback: Optional[Callable[[int, int, int], None]] = None
     ) -> List[Dict[str, Any]]:
         """Maintains backward compatibility with older callers."""
