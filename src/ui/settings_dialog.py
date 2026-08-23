@@ -88,7 +88,7 @@ class SettingsDialog(QtWidgets.QDialog):
         self.temp_spin = QtWidgets.QDoubleSpinBox()
         self.temp_spin.setRange(0.0, 2.0)
         self.temp_spin.setSingleStep(0.1)
-        self.temp_spin.setValue(0.7)
+        self.temp_spin.setValue(0.3)
 
         self.thinking_combo = QtWidgets.QComboBox()
         self.thinking_combo.addItems(["low", "high"])

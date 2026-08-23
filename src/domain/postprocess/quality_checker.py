@@ -75,9 +75,22 @@ class QualityChecker:
         return False, None
 
     @classmethod
+    def count_sentences(cls, text: str) -> int:
+        """
+        Counts sentences based on terminators (. ! ? 。 ！？ \n) and meaningful clauses.
+        """
+        if not text:
+            return 0
+        clean = cls.extract_clean_text(text)
+        if not clean:
+            return 0
+        sentences = [s.strip() for s in re.split(r'[\n.!?。！？]+', clean) if len(s.strip()) > 0]
+        return max(len(sentences), 1)
+
+    @classmethod
     def inspect_chunk(cls, source_text: str, translated_text: str) -> Dict[str, Any]:
         """
-        Inspects chunk for Content Drop (missing text), repetition loops, and severe length mismatch.
+        Inspects chunk for Content Drop (missing text), repetition loops, sentence bloating, and length mismatch.
         """
         src_text_clean = cls.extract_clean_text(source_text)
         trans_text_clean = cls.extract_clean_text(translated_text)
@@ -90,6 +103,7 @@ class QualityChecker:
                 "is_suspicious": False,
                 "is_content_drop": False,
                 "is_repetition": False,
+                "is_hallucination": False,
                 "ratio": 0.0,
                 "issue": None
             }
@@ -102,6 +116,7 @@ class QualityChecker:
                 "is_suspicious": True,
                 "is_content_drop": True,
                 "is_repetition": False,
+                "is_hallucination": False,
                 "ratio": 0.0,
                 "issue": issue
             }
@@ -114,6 +129,7 @@ class QualityChecker:
                 "is_suspicious": True,
                 "is_content_drop": True,
                 "is_repetition": False,
+                "is_hallucination": False,
                 "ratio": trans_len / src_len if src_len > 0 else 0.0,
                 "issue": issue
             }
@@ -129,6 +145,7 @@ class QualityChecker:
                 "is_suspicious": True,
                 "is_content_drop": False,
                 "is_repetition": True,
+                "is_hallucination": True,
                 "ratio": trans_len / src_len if src_len > 0 else 0.0,
                 "issue": issue
             }
@@ -142,6 +159,7 @@ class QualityChecker:
                 "is_content_drop": False,
                 "is_repetition": False,
                 "is_tag_corrupted": True,
+                "is_hallucination": False,
                 "ratio": trans_len / src_len if src_len > 0 else 0.0,
                 "issue": issue
             }
@@ -155,28 +173,58 @@ class QualityChecker:
                 "is_content_drop": False,
                 "is_repetition": False,
                 "is_thinking_leak": True,
+                "is_hallucination": False,
                 "ratio": trans_len / src_len if src_len > 0 else 0.0,
                 "issue": issue
             }
 
-        # 4. Length Ratio Anomaly
+        # 3.7. Sentence Count Distortion Check (Bloating / Expansion Hallucination)
+        src_sents = cls.count_sentences(source_text)
+        trans_sents = cls.count_sentences(translated_text)
+        sent_diff = trans_sents - src_sents
+        sent_ratio = trans_sents / src_sents if src_sents > 0 else 1.0
+
+        if (sent_ratio > 1.8 and sent_diff >= 2) or sent_diff >= 3:
+            issue = f"SENTENCE_BLOATING_HALLUCINATION (원문 {src_sents}문장 대비 번역문 {trans_sents}문장으로 급증, +{sent_diff}문장 / 비율 {sent_ratio:.2f}배)"
+            logger.warning(f"Quality Check Alert: {issue}")
+            return {
+                "is_suspicious": True,
+                "is_content_drop": False,
+                "is_repetition": False,
+                "is_hallucination": True,
+                "ratio": trans_len / src_len if src_len > 0 else 0.0,
+                "issue": issue
+            }
+
+        # 4. Length Ratio Anomaly Check
         ratio = trans_len / src_len if src_len > 0 else 1.0
         is_suspicious = False
+        is_hallucination = False
         issue = None
 
-        if ratio < 0.25 and src_len > 50:
-            is_suspicious = True
-            issue = f"OMISSION_SUSPECTED (번역문 길이 급감: 비율 {ratio:.2f})"
-            logger.warning(f"Quality Check Alert: {issue}")
-        elif ratio > 3.5 and src_len > 50:
-            is_suspicious = True
-            issue = f"HALLUCINATION_SUSPECTED (번역문 길이 급증: 비율 {ratio:.2f})"
-            logger.warning(f"Quality Check Alert: {issue}")
+        if src_len > 50:
+            if ratio < 0.25:
+                is_suspicious = True
+                issue = f"OMISSION_SUSPECTED (번역문 길이 급감: 비율 {ratio:.2f})"
+                logger.warning(f"Quality Check Alert: {issue}")
+            elif ratio > 2.2:
+                is_suspicious = True
+                is_hallucination = True
+                issue = f"HALLUCINATION_SUSPECTED (번역문 길이 급증: 비율 {ratio:.2f} > 2.2)"
+                logger.warning(f"Quality Check Alert: {issue}")
+        else:
+            # Short text / dialogue protection (src_len <= 50)
+            if src_len >= 5 and (ratio > 3.0 or (trans_len - src_len >= 60) or trans_len > 120):
+                is_suspicious = True
+                is_hallucination = True
+                issue = f"HALLUCINATION_SUSPECTED (단문 대화 대비 번역문 급증: 원문 {src_len}자 -> 번역문 {trans_len}자, 비율 {ratio:.2f})"
+                logger.warning(f"Quality Check Alert: {issue}")
 
         return {
             "is_suspicious": is_suspicious,
             "is_content_drop": False,
             "is_repetition": False,
+            "is_hallucination": is_hallucination,
             "ratio": ratio,
             "issue": issue
         }

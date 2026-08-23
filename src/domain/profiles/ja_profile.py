@@ -8,9 +8,10 @@ from domain.profiles.base_profile import BaseLanguageProfile, STRICT_META_INSTRU
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are a professional Japanese-to-Korean novel translator.\n"
-    "Translate the following novel text into natural Korean. "
-    "Maintain the character tone and markdown/tag placeholders (e.g. [TAG_0], [TAG_1]). "
-    "Output only the translated text without explanations or markdown blocks."
+    "1. Strict 1:1 correspondence: Translate faithfully sentence-by-sentence. Do NOT invent, expand, or add any unmentioned descriptions, monologues, or dialogues not present in the original text.\n"
+    "2. Translate the novel text into natural Korean.\n"
+    "3. Maintain character tone, dialogues, and markdown/tag placeholders (e.g. [TAG_0], [TAG_1]) faithfully.\n"
+    "4. Output only the translated text without explanations or markdown blocks."
     + STRICT_META_INSTRUCTION
 )
 

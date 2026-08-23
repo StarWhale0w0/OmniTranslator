@@ -200,7 +200,7 @@ class GeminiClient:
         self,
         prompt_contents: List[genai_types.Content],
         model_name: str = "gemini-3.1-pro-preview",
-        temperature: float = 0.7,
+        temperature: float = 0.3,
         top_p: float = 0.9,
         thinking_budget: Optional[int] = None,
         system_instruction: Optional[str] = None,

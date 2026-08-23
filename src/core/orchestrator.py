@@ -329,6 +329,15 @@ class TranslationOrchestrator(QtCore.QObject):
                                 if content_rule not in current_sys_instruction:
                                     current_sys_instruction += content_rule
 
+                            if qc_result.get("is_hallucination", False) or "HALLUCINATION" in str(issue) or "BLOATING" in str(issue):
+                                hallucination_rule = (
+                                    "\n\n[긴급 원문 1:1 대조 번역 및 임의 창작 금지 지침]\n"
+                                    "원문에 없는 인물의 심리 묘사, 배경 설명, 미언급 대화나 상황을 절대로 임의로 지어내거나 덧붙이지 마십시오. "
+                                    "원문의 모든 문장과 정확히 1:1로 대응되도록 엄격하고 절제된 번역문만을 출력하십시오."
+                                )
+                                if hallucination_rule not in current_sys_instruction:
+                                    current_sys_instruction += hallucination_rule
+
                             if gemini_att < max_gemini_qc_retries - 1:
                                 self.key_manager.rotate_key(is_rate_limit=False, cooldown_seconds=15.0)
                                 await asyncio.sleep(1.0 * (gemini_att + 1))

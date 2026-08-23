@@ -17,7 +17,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "api_keys": [],
     "translation_model": "gemini-3.1-pro-preview",
     "glossary_model": "gemini-3.1-pro-preview",
-    "temperature": 0.7,
+    "temperature": 0.3,
     "top_p": 0.9,
     "thinking_level": "high",
     "source_lang": "JA",
