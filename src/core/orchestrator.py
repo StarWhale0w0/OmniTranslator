@@ -256,6 +256,8 @@ class TranslationOrchestrator(QtCore.QObject):
                 gemini_success = False
                 current_sys_instruction = final_system_instruction
                 max_gemini_qc_retries = 4
+                best_gemini_candidate = ""
+                best_qc_score = -99999.0
 
                 # 4. Primary Translation: Gemini API with Quality-Check Retry & Key Failover Loop
                 for gemini_att in range(max_gemini_qc_retries):
@@ -289,6 +291,20 @@ class TranslationOrchestrator(QtCore.QObject):
                         # Pre-unmask test to inspect tag integrity
                         test_unmasked = TagMasker.unmask_tags(cleaned, tag_map)
                         qc_result = QualityChecker.inspect_chunk(masked_text, test_unmasked)
+
+                        # Track best Gemini candidate during retries
+                        if cleaned.strip() and cleaned != masked_text:
+                            cand_score = 100.0
+                            if qc_result.get("is_tag_corrupted", False): cand_score -= 40.0
+                            if qc_result.get("is_thinking_leak", False): cand_score -= 30.0
+                            if qc_result.get("is_content_drop", False): cand_score -= 50.0
+                            if qc_result.get("is_repetition", False): cand_score -= 30.0
+                            if qc_result.get("is_hallucination", False): cand_score -= 20.0
+                            ratio = qc_result.get("ratio", 1.0)
+                            cand_score -= abs(ratio - 1.5) * 10.0
+                            if cand_score > best_qc_score:
+                                best_qc_score = cand_score
+                                best_gemini_candidate = cleaned
 
                         # If QualityChecker detects any defect (tag corruption, thinking leak, content drop):
                         if qc_result["is_suspicious"]:
@@ -329,6 +345,15 @@ class TranslationOrchestrator(QtCore.QObject):
                                 if content_rule not in current_sys_instruction:
                                     current_sys_instruction += content_rule
 
+                            if qc_result.get("is_untranslated_hanja", False) or "HANJA" in str(issue):
+                                hanja_rule = (
+                                    "\n\n[긴급 원문 한자(CJK) 한국어 번역 절대 지침]\n"
+                                    "번역문에 원문의 중국어 한자를 단 한 글자도 남겨두지 마십시오. "
+                                    "모든 한자를 반드시 한국어(인명은 표준 병음 한글 표기, 지명/사물은 한국식 한자음)로 100% 완전하게 번역하여 출력하십시오."
+                                )
+                                if hanja_rule not in current_sys_instruction:
+                                    current_sys_instruction += hanja_rule
+
                             if qc_result.get("is_hallucination", False) or "HALLUCINATION" in str(issue) or "BLOATING" in str(issue):
                                 hallucination_rule = (
                                     "\n\n[긴급 원문 1:1 대조 번역 및 임의 창작 금지 지침]\n"
@@ -361,18 +386,30 @@ class TranslationOrchestrator(QtCore.QObject):
                         else:
                             break
 
-                # 4.4. Extreme Fallback: Only if all Gemini retries and keys completely fail
+                # 4.4. Fail-Fast Hard Stop: Never save defective or untranslated chunks to checkpoint
                 if not gemini_success:
-                    logger.error(
-                        f"Chunk #{idx+1}: Gemini {max_gemini_qc_retries}회 재시도 및 키 순환 모두 실패 -> 최후 수단으로 GoogleTranslator 가동."
-                    )
+                    last_issue = qc_result.get("issue", "품질 검사 미달") if 'qc_result' in locals() else "Gemini 응답 부재"
+                    abort_reason = f"Chunk #{idx+1} 치명적 품질 결함 ({last_issue}) - Gemini {max_gemini_qc_retries}회 재시도 실패"
+                    logger.error(f"[FAIL-FAST ABORT] {abort_reason}. 체크포인트 오염 방지를 위해 번역 파이프라인을 즉시 안전 중단합니다.")
+                    
+                    self.cancel_requested = True
+                    self.is_running = False
+                    
                     self.signals.log_emitted.emit(
-                        "WARNING",
-                        f"Chunk #{idx+1}: [최후 수단 폴백] Gemini {max_gemini_qc_retries}회 재시도 소진 -> GoogleTranslator 번역 실행"
+                        "ERROR",
+                        f"🚨 [긴급 강제 중단] Chunk #{idx+1}: {last_issue}\n"
+                        f"미번역 한자 잔존 또는 품질 결함으로 데이터 오염을 방지하기 위해 작업을 즉시 중단했습니다. (체크포인트 보존)"
                     )
-                    translated_masked = await FallbackTranslator.translate_async(
-                        masked_text, source_lang=language, target_lang="KO"
+                    self.signals.status_changed.emit("품질 기준 미달로 안전을 위해 번역 프로세스를 강제 중단합니다")
+                    self.signals.completed.emit(
+                        False,
+                        f"[번역 긴급 중단]\n\n"
+                        f"청크 #{idx+1}에서 품질 기준에 미달하는 결함이 감지되었습니다.\n"
+                        f"사유: {last_issue}\n\n"
+                        f"불량 데이터의 체크포인트 기록을 방지하고 데이터 무결성을 보호하기 위해 번역 프로세스를 안전하게 강제 중단했습니다.\n"
+                        f"API 키 상태를 점검하거나 프롬프트를 확인한 후 다시 시작해 주세요."
                     )
+                    return None
 
                 # 4.5. Glossary Post-Correction & Korean Josa Repair
                 if glossary_entries and use_glossary:
@@ -394,7 +431,31 @@ class TranslationOrchestrator(QtCore.QObject):
                     logger.warning(f"Chunk #{idx+1}: 최종 출력 공백 -> 원문 태그 안전 보존")
                     final_translated = text_chunk
 
-                # Save pure translation output only (Zero text pollution)
+                # 6. Final Integrity Validation before saving to Checkpoint
+                is_valid, invalid_reason = SessionManager.is_chunk_valid(final_translated)
+                if not is_valid:
+                    abort_reason = f"Chunk #{idx+1} 최종 산출물 무결성 검증 실패: {invalid_reason}"
+                    logger.error(f"[FAIL-FAST ABORT] {abort_reason}. 체크포인트 오염 방지를 위해 번역 파이프라인을 즉시 안전 중단합니다.")
+                    
+                    self.cancel_requested = True
+                    self.is_running = False
+                    
+                    self.signals.log_emitted.emit(
+                        "ERROR",
+                        f"🚨 [긴급 강제 중단] Chunk #{idx+1}: {invalid_reason}\n"
+                        f"데이터 무결성 보호를 위해 작업을 즉시 중단했습니다."
+                    )
+                    self.signals.status_changed.emit("품질 기준 미달로 안전을 위해 번역 프로세스를 강제 중단합니다")
+                    self.signals.completed.emit(
+                        False,
+                        f"[번역 긴급 중단]\n\n"
+                        f"청크 #{idx+1}의 최종 번역문에서 데이터 무결성 결함이 감지되었습니다.\n"
+                        f"사유: {invalid_reason}\n\n"
+                        f"불량 데이터의 체크포인트 저장을 차단하기 위해 프로세스를 안전하게 강제 중단했습니다."
+                    )
+                    return None
+
+                # Save pure translation output only (Passed all quality checks)
                 translated_dict[idx] = final_translated
                 
                 # Update UI preview and checkpoint with pure translated text
@@ -429,10 +490,14 @@ class TranslationOrchestrator(QtCore.QObject):
                     ch_tasks.append((global_chunk_idx, chunk_str))
                     global_chunk_idx += 1
 
-                # Execute chapter chunks in parallel
+                # Execute chapter chunks
                 ch_results = []
                 for g_idx, c_str in ch_tasks:
+                    if self.cancel_requested or not self.is_running:
+                        break
                     res = await translate_single_chunk(g_idx, c_str)
+                    if res is None or self.cancel_requested or not self.is_running:
+                        break
                     ch_results.append(res)
                     
                     self.signals.progress.emit(
@@ -441,11 +506,14 @@ class TranslationOrchestrator(QtCore.QObject):
                         f"챕터 {ch_idx+1}/{total_chapters} 번역 중... ({len(translated_dict)} 청크 완료)"
                     )
 
+                if self.cancel_requested or not self.is_running or len(ch_results) < len(ch_tasks):
+                    break
+
                 # HTML DOM reconstruction per chapter
                 rebuilt_html = EpubIO.rebuild_chapter_html(raw_html, ch_results)
                 chapter.set_content(rebuilt_html.encode('utf-8'))
 
-            if not self.cancel_requested:
+            if not self.cancel_requested and self.is_running:
                 self.signals.status_changed.emit("최종 EPUB 파일 패키징 중...")
                 EpubIO.save_epub(book, output_path)
 
@@ -458,16 +526,22 @@ class TranslationOrchestrator(QtCore.QObject):
             chunks = txt_chunker.split_into_chunks(raw_content, max_size=configured_chunk_size)
             total_chunks = len(chunks)
 
-            tasks = [translate_single_chunk(i, chunks[i]) for i in range(total_chunks)]
-            results = await asyncio.gather(*tasks)
+            results = []
+            for i in range(total_chunks):
+                if self.cancel_requested or not self.is_running:
+                    break
+                res = await translate_single_chunk(i, chunks[i])
+                if res is None or self.cancel_requested or not self.is_running:
+                    break
+                results.append(res)
 
-            if not self.cancel_requested:
+            if not self.cancel_requested and self.is_running and len(results) == total_chunks:
                 final_text = "\n\n".join(results)
                 final_text = TextCleaner.strip_html_tags(final_text)
                 TxtIO.write_text_file(output_path, final_text)
 
-        if self.cancel_requested:
-            self.signals.completed.emit(False, "작업이 사용자에 의해 취소되었습니다.")
+        if self.cancel_requested or not self.is_running:
+            self.is_running = False
             return
 
         # Cleanup checkpoint on clean finish

@@ -30,6 +30,7 @@ class SessionManager:
         re.IGNORECASE
     )
     UNMASKED_TAG_REGEX = re.compile(r'\[\s*TAG\s*_?\s*\d+\s*\]', re.IGNORECASE)
+    HANJA_REGEX = re.compile(r'[\u4e00-\u9fff]')
 
     @classmethod
     def is_chunk_valid(cls, chunk_text: str) -> Tuple[bool, Optional[str]]:
@@ -51,6 +52,14 @@ class SessionManager:
         # Check for unmasked [TAG_N] placeholders
         if cls.UNMASKED_TAG_REGEX.search(chunk_text):
             return False, "미복원된 [TAG_N] 플레이스홀더 잔존"
+
+        # Check for untranslated Hanja (CJK) ideographs (>= 5 chars or >= 3% of plain text)
+        clean_body = re.sub(r'<[^>]+>', '', chunk_text)
+        hanja_matches = cls.HANJA_REGEX.findall(clean_body)
+        hanja_count = len(hanja_matches)
+        if hanja_count >= 5 or (len(clean_body) >= 30 and (hanja_count / len(clean_body)) >= 0.03):
+            sample_hanja = "".join(hanja_matches[:10])
+            return False, f"미번역 한자(CJK) {hanja_count}자 잔존 ('{sample_hanja}...')"
 
         return True, None
 

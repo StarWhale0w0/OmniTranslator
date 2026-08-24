@@ -101,6 +101,7 @@ class QualityChecker:
         if src_len == 0:
             return {
                 "is_suspicious": False,
+                "is_critical": False,
                 "is_content_drop": False,
                 "is_repetition": False,
                 "is_hallucination": False,
@@ -114,6 +115,7 @@ class QualityChecker:
             logger.warning(f"Quality Check Alert: {issue}")
             return {
                 "is_suspicious": True,
+                "is_critical": True,
                 "is_content_drop": True,
                 "is_repetition": False,
                 "is_hallucination": False,
@@ -127,6 +129,7 @@ class QualityChecker:
             logger.warning(f"Quality Check Alert: {issue}")
             return {
                 "is_suspicious": True,
+                "is_critical": True,
                 "is_content_drop": True,
                 "is_repetition": False,
                 "is_hallucination": False,
@@ -143,6 +146,7 @@ class QualityChecker:
             logger.warning(f"Quality Check Alert: {issue}")
             return {
                 "is_suspicious": True,
+                "is_critical": False,
                 "is_content_drop": False,
                 "is_repetition": True,
                 "is_hallucination": True,
@@ -156,6 +160,7 @@ class QualityChecker:
             logger.warning(f"Quality Check Alert: {issue}")
             return {
                 "is_suspicious": True,
+                "is_critical": True,
                 "is_content_drop": False,
                 "is_repetition": False,
                 "is_tag_corrupted": True,
@@ -170,6 +175,7 @@ class QualityChecker:
             logger.warning(f"Quality Check Alert: {issue}")
             return {
                 "is_suspicious": True,
+                "is_critical": False,
                 "is_content_drop": False,
                 "is_repetition": False,
                 "is_thinking_leak": True,
@@ -184,14 +190,35 @@ class QualityChecker:
         sent_diff = trans_sents - src_sents
         sent_ratio = trans_sents / src_sents if src_sents > 0 else 1.0
 
-        if (sent_ratio > 1.8 and sent_diff >= 2) or sent_diff >= 3:
+        if sent_ratio > 2.2 and sent_diff >= 10:
             issue = f"SENTENCE_BLOATING_HALLUCINATION (원문 {src_sents}문장 대비 번역문 {trans_sents}문장으로 급증, +{sent_diff}문장 / 비율 {sent_ratio:.2f}배)"
             logger.warning(f"Quality Check Alert: {issue}")
             return {
                 "is_suspicious": True,
+                "is_critical": False,
                 "is_content_drop": False,
                 "is_repetition": False,
                 "is_hallucination": True,
+                "ratio": trans_len / src_len if src_len > 0 else 0.0,
+                "issue": issue
+            }
+
+        # 3.8. Untranslated CJK (Hanja) Ideograph Residual Check
+        hanja_matches = re.findall(r'[\u4e00-\u9fff]', trans_text_clean)
+        hanja_count = len(hanja_matches)
+        hanja_ratio = (hanja_count / trans_len) if trans_len > 0 else 0.0
+
+        if hanja_count >= 5 or (trans_len >= 30 and hanja_ratio >= 0.03):
+            sample_hanja = "".join(hanja_matches[:10])
+            issue = f"UNTRANSLATED_HANJA_DETECTED (번역문 내 미번역 한자 {hanja_count}자({hanja_ratio*100:.1f}%) 잔존: '{sample_hanja}...')"
+            logger.warning(f"Quality Check Alert: {issue}")
+            return {
+                "is_suspicious": True,
+                "is_critical": True,
+                "is_content_drop": False,
+                "is_repetition": False,
+                "is_untranslated_hanja": True,
+                "is_hallucination": False,
                 "ratio": trans_len / src_len if src_len > 0 else 0.0,
                 "issue": issue
             }
@@ -200,11 +227,13 @@ class QualityChecker:
         ratio = trans_len / src_len if src_len > 0 else 1.0
         is_suspicious = False
         is_hallucination = False
+        is_critical = False
         issue = None
 
         if src_len > 50:
             if ratio < 0.25:
                 is_suspicious = True
+                is_critical = True
                 issue = f"OMISSION_SUSPECTED (번역문 길이 급감: 비율 {ratio:.2f})"
                 logger.warning(f"Quality Check Alert: {issue}")
             elif ratio > 2.2:
@@ -222,6 +251,7 @@ class QualityChecker:
 
         return {
             "is_suspicious": is_suspicious,
+            "is_critical": is_critical,
             "is_content_drop": False,
             "is_repetition": False,
             "is_hallucination": is_hallucination,
