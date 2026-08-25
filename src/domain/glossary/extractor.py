@@ -213,6 +213,25 @@ class GlossaryExtractor:
                     kw = kw[:-len(suffix)].strip()
                     break
 
+            # If the keyword itself is a standalone generic honorific, change category to '호칭' and standardize translation
+            generic_honorific_map = {
+                '先生': '선생님',
+                '女士': '여사',
+                '小姐': '아가씨',
+                '师傅': '사부',
+                '师父': '사부님',
+                '同志': '동지',
+                '阁下': '귀하',
+                '前辈': '선배님',
+                '道友': '도우',
+                '老夫': '노부',
+                '本座': '본좌',
+                '弟子': '제자'
+            }
+            if kw in generic_honorific_map:
+                cat = "호칭"
+                tr = generic_honorific_map[kw]
+
         return kw, tr, cat
 
     @classmethod
