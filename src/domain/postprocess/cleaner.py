@@ -179,6 +179,11 @@ class TextCleaner:
         # 5.5. Remove system pollution tags ([구글 폴백], [2차 폴백], [Gemini 차단], [GoogleTranslator 폴백], etc.)
         cleaned = re.sub(r'\[\s*(?:구글\s*폴백|2차\s*폴백|Gemini\s*차단|GoogleTranslator\s*폴백|본문\s*누락\s*방지|최후\s*폴백)\s*\]', '', cleaned, flags=re.IGNORECASE)
 
+        # 5.6. Correct common phonetic transliteration artifacts for Chinese web novels (e.g. 小声/出声 mistranslated as '샤오리')
+        cleaned = re.sub(r'끙\s*하는\s*샤오리를?\s*(?:냈고|내며|내더니)', '낮은 신음을 흘렸고', cleaned)
+        cleaned = re.sub(r'감히\s*샤오리를?\s*내지\s*못', '감히 숨소리조차 내지 못', cleaned)
+        cleaned = re.sub(r'샤오리거거', '샤오리 오빠', cleaned)
+
         # 6. Remove language-specific regex patterns (ads, headers)
         if extra_patterns:
             for pattern in extra_patterns:

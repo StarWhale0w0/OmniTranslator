@@ -53,13 +53,22 @@ class SessionManager:
         if cls.UNMASKED_TAG_REGEX.search(chunk_text):
             return False, "미복원된 [TAG_N] 플레이스홀더 잔존"
 
-        # Check for untranslated Hanja (CJK) ideographs (>= 5 chars or >= 3% of plain text)
+        # Check for untranslated Hanja (CJK) ideographs
         clean_body = re.sub(r'<[^>]+>', '', chunk_text)
+        clean_body = re.sub(r'\[\s*TAG\s*_?\s*\d+\s*\]', '', clean_body, flags=re.IGNORECASE)
         hanja_matches = cls.HANJA_REGEX.findall(clean_body)
+        hangul_matches = re.findall(r'[\uac00-\ud7af]', clean_body)
         hanja_count = len(hanja_matches)
-        if hanja_count >= 5 or (len(clean_body) >= 30 and (hanja_count / len(clean_body)) >= 0.03):
-            sample_hanja = "".join(hanja_matches[:10])
-            return False, f"미번역 한자(CJK) {hanja_count}자 잔존 ('{sample_hanja}...')"
+        hangul_count = len(hangul_matches)
+
+        if hanja_count > 0:
+            hanja_ratio = (hanja_count / len(clean_body)) if len(clean_body) > 0 else 0.0
+            # Allow legitimate Hanja (e.g. name wordplay, incantations, annotations) if Korean text is predominant
+            if hangul_count >= 20 and hanja_ratio < 0.12 and hangul_count > hanja_count * 2:
+                pass
+            elif hanja_count >= 5 or (len(clean_body) >= 30 and hanja_ratio >= 0.03):
+                sample_hanja = "".join(hanja_matches[:10])
+                return False, f"미번역 한자(CJK) {hanja_count}자 잔존 ('{sample_hanja}...')"
 
         return True, None
 
