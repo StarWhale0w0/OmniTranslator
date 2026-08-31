@@ -1,6 +1,7 @@
 """
 OmniTranslator Pro - EPUB File I/O Engine
-Ported directly from seamarine-lightnovel-translator.
+Handles EPUB reading, chapter extraction, DOM reconstruction,
+and automated Table of Contents (TOC), NCX, NAV, and metadata synchronization.
 """
 
 import copy
@@ -10,12 +11,14 @@ from bs4 import BeautifulSoup
 import ebooklib
 from ebooklib import epub
 from ebooklib.epub import EpubHtml
+from domain.epub.toc_processor import TOCProcessor
 from common.logger import setup_logger
 
 logger = setup_logger("EpubIO")
 
+
 class EpubIO:
-    """Reads and reconstructs EPUB ebooks using seamarine's verified EpubHtml chapter workflow."""
+    """Reads and reconstructs EPUB ebooks with complete TOC and Navigation synchronization."""
 
     @classmethod
     def get_epub_chapters(cls, epub_path: Path) -> Tuple[Any, List[EpubHtml]]:
@@ -30,12 +33,55 @@ class EpubIO:
         book, chapters = cls.get_epub_chapters(epub_path)
         text_parts = []
         for ch in chapters:
-            content = ch.get_content().decode('utf-8', errors='ignore')
+            content = TOCProcessor.get_item_content_str(ch)
             soup = BeautifulSoup(content, 'html.parser')
             cleaned = soup.get_text(separator='\n').strip()
             if cleaned:
                 text_parts.append(cleaned)
         return "\n\n".join(text_parts)
+
+    @classmethod
+    def extract_toc_metadata(cls, book: Any) -> List[Dict[str, Any]]:
+        """Extracts initial TOC structure from book."""
+        return TOCProcessor.extract_toc_metadata(book)
+
+    @classmethod
+    def apply_translated_toc(
+        cls,
+        book: Any,
+        toc_entries_cache: Optional[List[Dict[str, Any]]] = None,
+        translated_title_map: Optional[Dict[str, str]] = None,
+        book_title: Optional[str] = None,
+        input_file_path: Optional[Path] = None,
+        language: str = "ko"
+    ) -> List[Dict[str, Any]]:
+        """
+        Synchronizes book.toc, visual TOC pages, toc.ncx, nav.xhtml, and DC metadata
+        with translated chapter titles.
+        """
+        # 1. Sync book.toc Links & Sections with translated HTML DOMs
+        updated_toc_meta, href_map = TOCProcessor.sync_toc_with_translated_documents(
+            book=book,
+            toc_entries_cache=toc_entries_cache,
+            translated_title_map=translated_title_map
+        )
+
+        # 2. Infer or apply book title
+        final_book_title = book_title
+        if not final_book_title:
+            final_book_title = TOCProcessor.extract_or_infer_book_title(book, input_file_path)
+
+        # 3. Ensure Dublin Core metadata & navigation items (toc.ncx, nav.xhtml)
+        TOCProcessor.ensure_navigation_and_metadata(
+            book=book,
+            translated_book_title=final_book_title,
+            language=language
+        )
+
+        # 4. Update visual HTML TOC pages if present
+        TOCProcessor.update_visual_toc_pages(book, href_map)
+
+        return updated_toc_meta
 
     @classmethod
     def rebuild_chapter_html(cls, original_html: str, translated_chunks: List[str]) -> str:
@@ -56,8 +102,34 @@ class EpubIO:
         return str(new_soup)
 
     @classmethod
-    def save_epub(cls, book: Any, output_epub_path: Path) -> None:
-        """Writes reconstructed EPUB book to output path."""
+    def save_epub(
+        cls,
+        book: Any,
+        output_epub_path: Path,
+        toc_entries: Optional[List[Dict[str, Any]]] = None,
+        translated_title_map: Optional[Dict[str, str]] = None,
+        book_title: Optional[str] = None,
+        input_file_path: Optional[Path] = None,
+        language: str = "ko",
+        auto_sync_toc: bool = True
+    ) -> List[Dict[str, Any]]:
+        """
+        Applies translated TOC and writes reconstructed EPUB book to output path.
+        Returns the finalized TOC metadata entries list.
+        """
         output_epub_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        final_toc_meta = []
+        if auto_sync_toc:
+            final_toc_meta = cls.apply_translated_toc(
+                book=book,
+                toc_entries_cache=toc_entries,
+                translated_title_map=translated_title_map,
+                book_title=book_title,
+                input_file_path=input_file_path,
+                language=language
+            )
+
         epub.write_epub(str(output_epub_path), book)
-        logger.info(f"EPUB saved successfully to {output_epub_path}")
+        logger.info(f"EPUB with synchronized Korean TOC saved successfully to {output_epub_path}")
+        return final_toc_meta

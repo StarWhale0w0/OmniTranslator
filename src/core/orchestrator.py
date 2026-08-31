@@ -171,15 +171,19 @@ class TranslationOrchestrator(QtCore.QObject):
         glossary_entries: List[Dict[str, Any]] = active_glossary if active_glossary is not None else GlossaryExtractor.load_glossary_json(glossary_file)
 
         translated_dict: Dict[int, str] = {}
+        toc_entries: List[Dict[str, Any]] = []
+        book_title: Optional[str] = None
         
         # Check existing checkpoint
         if resume_existing:
             ckpt = SessionManager.load_checkpoint(input_path)
-            if ckpt and "translated_chunks" in ckpt:
-                translated_dict = ckpt["translated_chunks"]
+            if ckpt:
+                translated_dict = ckpt.get("translated_chunks", {})
+                toc_entries = ckpt.get("toc", [])
+                book_title = ckpt.get("book_title", None)
                 if not glossary_entries:
                     glossary_entries = ckpt.get("glossary", [])
-                logger.info(f"Resuming job: {len(translated_dict)} chunks already complete.")
+                logger.info(f"Resuming job: {len(translated_dict)} chunks already complete, {len(toc_entries)} TOC items loaded.")
 
         start_time = time.time()
         max_workers = self.config.get("max_workers", 4)
@@ -219,7 +223,10 @@ class TranslationOrchestrator(QtCore.QObject):
                 self.signals.log_emitted.emit("INFO", f"Chunk #{idx+1}: [미디어 패스] 순수 이미지/삽화 챕터 즉시 바이패스")
                 self.signals.preview_updated.emit(text_chunk, "[표지/삽화 이미지 구간 - 바이패스됨]")
                 translated_dict[idx] = text_chunk
-                SessionManager.save_checkpoint(input_path, output_path, language, 0, translated_dict, glossary_entries)
+                SessionManager.save_checkpoint(
+                    input_path, output_path, language, 0, translated_dict, glossary_entries,
+                    toc=toc_entries, book_title=book_title
+                )
                 return text_chunk
 
             async with semaphore:
@@ -460,7 +467,10 @@ class TranslationOrchestrator(QtCore.QObject):
                 
                 # Update UI preview and checkpoint with pure translated text
                 self.signals.preview_updated.emit(text_chunk, final_translated)
-                SessionManager.save_checkpoint(input_path, output_path, language, 0, translated_dict, glossary_entries)
+                SessionManager.save_checkpoint(
+                    input_path, output_path, language, 0, translated_dict, glossary_entries,
+                    toc=toc_entries, book_title=book_title
+                )
                 return final_translated
 
         # =========================================================================
@@ -470,6 +480,11 @@ class TranslationOrchestrator(QtCore.QObject):
             book, chapters = EpubIO.get_epub_chapters(input_path)
             total_chapters = len(chapters)
             
+            # Extract initial TOC metadata from EPUB if not yet cached in checkpoint
+            if not toc_entries:
+                toc_entries = EpubIO.extract_toc_metadata(book)
+                logger.info(f"Extracted {len(toc_entries)} initial TOC entries from EPUB.")
+
             self.signals.status_changed.emit(f"EPUB 챕터 구조 분석 중... (총 {total_chapters}개 챕터)")
             global_chunk_idx = 0
 
@@ -477,7 +492,8 @@ class TranslationOrchestrator(QtCore.QObject):
                 if self.cancel_requested:
                     break
 
-                raw_html = chapter.get_content().decode('utf-8', errors='ignore')
+                raw_content = chapter.get_content()
+                raw_html = raw_content.decode('utf-8', errors='ignore') if isinstance(raw_content, bytes) else str(raw_content)
                 soup = BeautifulSoup(raw_html, 'html.parser')
                 body = soup.body if soup.body else soup
 
@@ -514,8 +530,26 @@ class TranslationOrchestrator(QtCore.QObject):
                 chapter.set_content(rebuilt_html.encode('utf-8'))
 
             if not self.cancel_requested and self.is_running:
-                self.signals.status_changed.emit("최종 EPUB 파일 패키징 중...")
-                EpubIO.save_epub(book, output_path)
+                self.signals.status_changed.emit("목차(TOC) 및 네비게이션 메타데이터 한국어 동기화 중...")
+                logger.info("Synchronizing and applying translated TOC to EPUB and metadata...")
+                
+                # Apply synchronized TOC & Navigation (toc.ncx, nav.xhtml, book.toc, visual TOC pages, DC title)
+                final_toc_meta = EpubIO.save_epub(
+                    book=book,
+                    output_epub_path=output_path,
+                    toc_entries=toc_entries,
+                    book_title=book_title,
+                    input_file_path=input_path,
+                    language="ko",
+                    auto_sync_toc=True
+                )
+                
+                # Update checkpoint with final TOC metadata
+                SessionManager.update_toc_in_checkpoint(
+                    input_file_path=input_path,
+                    toc_entries=final_toc_meta,
+                    book_title=book.title
+                )
 
         # =========================================================================
         # TXT PARSED WORKFLOW

@@ -1,5 +1,6 @@
 """
 OmniTranslator Pro - Session & Checkpoint Manager
+Manages metadata serialization, atomic checkpoint recovery, TOC synchronization, and integrity validation.
 """
 
 import json
@@ -12,7 +13,7 @@ from common.logger import setup_logger
 logger = setup_logger("SessionManager")
 
 class SessionManager:
-    """Manages metadata serialization, atomic checkpoint recovery, and integrity validation for translation jobs."""
+    """Manages metadata serialization, atomic checkpoint recovery, TOC mapping, and integrity validation."""
 
     POLLUTION_REGEX = re.compile(
         r'\[\s*(?:구글\s*폴백|GoogleTranslator\s*폴백|2차\s*폴백|Gemini\s*차단|본문\s*누락|PROMPT_BLOCKED)\s*\]',
@@ -113,16 +114,20 @@ class SessionManager:
         language: str,
         total_chunks: int,
         translated_chunks: Dict[int, str],
-        glossary: List[Dict[str, Any]]
+        glossary: List[Dict[str, Any]],
+        toc: Optional[List[Dict[str, Any]]] = None,
+        book_title: Optional[str] = None
     ) -> Path:
-        """Atomic write of checkpoint data into .meta.json."""
+        """Atomic write of checkpoint data including TOC and title metadata into .meta.json."""
         meta_path = cls.get_meta_filepath(input_file_path)
         data = {
             "input_file": str(input_file_path),
             "output_file": str(output_file_path),
             "language": language,
+            "book_title": book_title,
             "total_chunks": total_chunks,
             "processed_count": len(translated_chunks),
+            "toc": toc or [],
             "translated_chunks": {str(k): v for k, v in translated_chunks.items()},
             "glossary": glossary
         }
@@ -132,13 +137,14 @@ class SessionManager:
             with open(temp_meta_path, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
             temp_meta_path.replace(meta_path)  # Atomic replace
-            logger.debug(f"Atomic Checkpoint saved: {meta_path} ({len(translated_chunks)} chunks)")
+            logger.debug(f"Atomic Checkpoint saved: {meta_path} ({len(translated_chunks)} chunks, {len(data['toc'])} TOC items)")
         except Exception as e:
             logger.error(f"Failed to save atomic checkpoint ({meta_path}): {e}")
         return meta_path
 
     @classmethod
     def load_checkpoint(cls, input_file_path: Path) -> Optional[Dict[str, Any]]:
+        """Loads and sanitizes existing checkpoint from .meta.json."""
         meta_path = cls.get_meta_filepath(input_file_path)
         if not meta_path.exists():
             return None
@@ -155,14 +161,46 @@ class SessionManager:
                             f"Sanitized checkpoint: {purged_count} contaminated/corrupted chunks purged for re-translation. "
                             f"{len(clean_chunks)} valid chunks retained."
                         )
-                logger.info(f"Loaded existing checkpoint from {meta_path} ({data.get('processed_count', 0)} chunks complete)")
+                logger.info(
+                    f"Loaded existing checkpoint from {meta_path} "
+                    f"({data.get('processed_count', 0)} chunks, {len(data.get('toc', []))} TOC items)"
+                )
                 return data
         except Exception as e:
             logger.error(f"Failed to load checkpoint ({meta_path}): {e}")
             return None
 
     @classmethod
+    def update_toc_in_checkpoint(
+        cls,
+        input_file_path: Path,
+        toc_entries: List[Dict[str, Any]],
+        book_title: Optional[str] = None
+    ) -> bool:
+        """Updates only the TOC and book_title in an existing .meta.json file."""
+        meta_path = cls.get_meta_filepath(input_file_path)
+        if not meta_path.exists():
+            return False
+        try:
+            with open(meta_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            data["toc"] = toc_entries
+            if book_title:
+                data["book_title"] = book_title
+            
+            temp_meta = meta_path.with_suffix(".tmp")
+            with open(temp_meta, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            temp_meta.replace(meta_path)
+            logger.info(f"Updated TOC entries ({len(toc_entries)} items) in checkpoint: {meta_path}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to update TOC in checkpoint ({meta_path}): {e}")
+            return False
+
+    @classmethod
     def remove_checkpoint(cls, input_file_path: Path) -> None:
+        """Removes metadata checkpoint file."""
         meta_path = cls.get_meta_filepath(input_file_path)
         if meta_path.exists():
             try:

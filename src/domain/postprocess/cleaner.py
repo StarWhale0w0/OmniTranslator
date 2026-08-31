@@ -179,10 +179,24 @@ class TextCleaner:
         # 5.5. Remove system pollution tags ([구글 폴백], [2차 폴백], [Gemini 차단], [GoogleTranslator 폴백], etc.)
         cleaned = re.sub(r'\[\s*(?:구글\s*폴백|2차\s*폴백|Gemini\s*차단|GoogleTranslator\s*폴백|본문\s*누락\s*방지|최후\s*폴백)\s*\]', '', cleaned, flags=re.IGNORECASE)
 
-        # 5.6. Correct common phonetic transliteration artifacts for Chinese web novels (e.g. 小声/出声 mistranslated as '샤오리')
+        # 5.6. Correct common phonetic transliteration artifacts for Chinese web novels
+        # A. Currency / Money '钱' mistranslated as '첸' (e.g. 단돈 한 첸 -> 단돈 한 푼, 첸을 주다 -> 돈을 주다)
+        cleaned = re.sub(r'(단돈\s*)?((?:한|두|세|네|몇|얼마의?|\d+)\s*)첸((?:[을를이가은는도에]|으로|로)?(?=[\s,.\?!~]|$))', r'\1\2푼\3', cleaned)
+        cleaned = re.sub(r'\b첸\s*한\s*푼\b', '돈 한 푼', cleaned)
+        cleaned = re.sub(r'\b첸\s*몇\s*푼\b', '돈 몇 푼', cleaned)
+        cleaned = re.sub(r'\b첸을\s*(주|받|내|벌|요구|뜯|빼앗|던지|지불|건네|챙기|모으|세)', r'돈을 \1', cleaned)
+        cleaned = re.sub(r'\b첸이\s*(없|모자라|많|필요|들|생기|궁하|떨어)', r'돈이 \1', cleaned)
+        cleaned = re.sub(r'\b첸으로\s*(환전|지불|계산|사|바꾸|갚)', r'돈으로 \1', cleaned)
+        cleaned = re.sub(r'\b첸과\s*은자', '돈과 은자', cleaned)
+        cleaned = re.sub(r'\b은자와\s*첸', '은자와 돈', cleaned)
+        cleaned = re.sub(r'\b단돈\s*한\s*첸\b', '단돈 한 푼', cleaned)
+
+        # B. Common noun / interjection mistranslations (e.g. 小声/出声 mistranslated as '샤오리')
         cleaned = re.sub(r'끙\s*하는\s*샤오리를?\s*(?:냈고|내며|내더니)', '낮은 신음을 흘렸고', cleaned)
         cleaned = re.sub(r'감히\s*샤오리를?\s*내지\s*못', '감히 숨소리조차 내지 못', cleaned)
         cleaned = re.sub(r'샤오리거거', '샤오리 오빠', cleaned)
+        cleaned = re.sub(r'\b거거\b', '오빠', cleaned)
+        cleaned = re.sub(r'\b메이메이\b', '여동생', cleaned)
 
         # 6. Remove language-specific regex patterns (ads, headers)
         if extra_patterns:
