@@ -3,7 +3,7 @@ OmniTranslator Pro - Global Constants
 """
 
 APP_NAME = "OmniTranslator Pro"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 
 SUPPORTED_LANGUAGES = ["JA", "ZH", "EN"]
 DEFAULT_LANGUAGE = "JA"

@@ -287,8 +287,8 @@ class QualityChecker:
             # If total character ratio is within normal translation range (0.8x ~ 2.0x), sentence count expansion (2.0x ~ 3.8x) is natural and valid.
             src_clauses = len([s for s in re.split(r'[\n.!?。！？，,；;：:—…]+', src_text_clean) if s.strip()])
             is_natural_splitting = (
-                (char_ratio <= 2.0 and sent_ratio <= 3.8) or
-                (char_ratio <= 2.1 and trans_sents <= max(src_clauses, src_sents * 2) + 5)
+                (char_ratio <= 2.8 and sent_ratio <= 3.8) or
+                (char_ratio <= 2.8 and trans_sents <= max(src_clauses, src_sents * 2) + 5)
             )
 
             if is_natural_splitting:
@@ -358,10 +358,10 @@ class QualityChecker:
                 is_critical = True
                 issue = f"OMISSION_SUSPECTED (번역문 길이 급감: 비율 {ratio:.2f})"
                 logger.warning(f"Quality Check Alert: {issue}")
-            elif ratio > 2.2:
+            elif ratio > 2.8:
                 is_suspicious = True
                 is_hallucination = True
-                issue = f"HALLUCINATION_SUSPECTED (번역문 길이 급증: 비율 {ratio:.2f} > 2.2)"
+                issue = f"HALLUCINATION_SUSPECTED (번역문 길이 급증: 비율 {ratio:.2f} > 2.8)"
                 logger.warning(f"Quality Check Alert: {issue}")
         else:
             # Short text / dialogue protection (src_len <= 50)

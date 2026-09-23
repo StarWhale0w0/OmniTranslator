@@ -198,6 +198,10 @@ class TextCleaner:
         cleaned = re.sub(r'\b거거\b', '오빠', cleaned)
         cleaned = re.sub(r'\b메이메이\b', '여동생', cleaned)
 
+        # 5.7. Refine dialogue tone and sentence endings within quotes
+        from domain.postprocess.dialogue_tone_corrector import DialogueToneCorrector
+        cleaned = DialogueToneCorrector.refine_dialogue_text(cleaned)
+
         # 6. Remove language-specific regex patterns (ads, headers)
         if extra_patterns:
             for pattern in extra_patterns:

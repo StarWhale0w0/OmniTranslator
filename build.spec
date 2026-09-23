@@ -38,6 +38,7 @@ hidden_imports = [
     
     # Internal project modules
     'common.config_loader',
+    'common.constants',
     'common.logger',
     'common.paths',
     'core.event_models',
@@ -47,10 +48,14 @@ hidden_imports = [
     'domain.chunkers.epub_dom_chunker',
     'domain.chunkers.txt_chunker',
     'domain.chunkers.plain_text_chunker',
+    'domain.epub.toc_processor',
     'domain.glossary.extractor',
     'domain.glossary.injector',
     'domain.postprocess.cleaner',
     'domain.postprocess.quality_checker',
+    'domain.postprocess.tag_masker',
+    'domain.postprocess.glossary_corrector',
+    'domain.postprocess.dialogue_tone_corrector',
     'domain.profiles.base_profile',
     'domain.profiles.ja_profile',
     'domain.profiles.zh_profile',
@@ -115,5 +120,6 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=icon_path
+    icon=icon_path,
+    version='file_version_info.txt' if os.path.exists('file_version_info.txt') else None
 )
