@@ -348,10 +348,24 @@ class GlossaryCorrector:
         # Sort replacement patterns by length descending to prevent substring collisions
         replacement_map.sort(key=lambda x: len(x[0]), reverse=True)
 
-        # 4. Perform replacements
+        # 4. Perform replacements with boundary protection
+        # For pure Hangul candidate patterns, enforce word boundary / non-Hangul lookbehind
+        # to strictly avoid corrupting composite words (e.g., '중얼거리다' getting corrupted by '얼거')
+        korean_josa_suffix = r'(?:은|는|이|가|을|를|과|와|으로|로|에서|서|에게|께|에|의|도|만|뿐|이나|나|이란|란|이라|라|이며|며|이든|든|이었|였|이에요|예요|아|야|처럼|마저|조차|부터|까지|하고)?'
+        
         for pattern, target in replacement_map:
-            if pattern in result:
+            if not pattern or pattern not in result:
+                continue
+
+            is_cjk = bool(re.search(r'[\u4e00-\u9fff]', pattern))
+            if is_cjk:
+                # CJK Hanja keyword directly in translated text -> safe to replace directly
                 result = result.replace(pattern, target)
+            else:
+                # Hangul reading/variant candidate -> MUST NOT match inside other Hangul words
+                escaped = re.escape(pattern)
+                regex = re.compile(rf'(?<![가-힣]){escaped}(?={korean_josa_suffix}(?:[^가-힣]|$))')
+                result = regex.sub(target, result)
 
         # 5. Fix Korean particles (조사) for all target words present in the translation
         sorted_targets = sorted(target_words, key=lambda x: len(x), reverse=True)

@@ -198,6 +198,12 @@ class TextCleaner:
         cleaned = re.sub(r'\b거거\b', '오빠', cleaned)
         cleaned = re.sub(r'\b메이메이\b', '여동생', cleaned)
 
+        # C. Fix split-word corruptions (e.g. 중둘째 형 -> 중얼거, 웅둘째 형 -> 웅얼거, 흥둘째 형 -> 흥얼거)
+        cleaned = re.sub(r'웅얼웅둘째\s*형', '웅얼웅얼거', cleaned)
+        cleaned = re.sub(r'중둘째\s*형', '중얼거', cleaned)
+        cleaned = re.sub(r'웅둘째\s*형', '웅얼거', cleaned)
+        cleaned = re.sub(r'흥둘째\s*형', '흥얼거', cleaned)
+
         # 5.7. Refine dialogue tone and sentence endings within quotes
         from domain.postprocess.dialogue_tone_corrector import DialogueToneCorrector
         cleaned = DialogueToneCorrector.refine_dialogue_text(cleaned)
