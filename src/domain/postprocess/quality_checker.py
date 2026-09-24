@@ -141,9 +141,14 @@ class QualityChecker:
         return max(len(sentences), 1)
 
     @classmethod
-    def inspect_chunk(cls, source_text: str, translated_text: str) -> Dict[str, Any]:
+    def inspect_chunk(cls, source_text: str, translated_text: str, tag_map_size: int = 0) -> Dict[str, Any]:
         """
         Inspects chunk for Content Drop (missing text), repetition loops, sentence bloating, and length mismatch.
+        Args:
+            source_text:     The original (masked) source text.
+            translated_text: The unmasked translated output.
+            tag_map_size:    Number of tags in the tag_map used for masking (0 = TXT plain-text mode).
+                             When 0, TAG_UNMASK_CORRUPTED is treated as a non-critical false positive.
         """
         src_text_clean = cls.extract_clean_text(source_text)
         trans_text_clean = cls.extract_clean_text(translated_text)
@@ -246,19 +251,32 @@ class QualityChecker:
             )
 
         # 3.5. Unmasked [TAG_N] Placeholder Corruption Check
-        if re.search(r'\[\s*TAG\s*_?\s*\d+\s*\]', translated_text, re.IGNORECASE):
-            issue = "TAG_UNMASK_CORRUPTED (잔여 [TAG_N] 플레이스홀더 감지)"
-            logger.warning(f"Quality Check Alert: {issue}")
-            return {
-                "is_suspicious": True,
-                "is_critical": True,
-                "is_content_drop": False,
-                "is_repetition": False,
-                "is_tag_corrupted": True,
-                "is_hallucination": False,
-                "ratio": trans_len / src_len if src_len > 0 else 0.0,
-                "issue": issue
-            }
+        residual_tags = re.findall(r'[\[［]\s*TAG\s*[_\-\s]*\d[\d\s]*\s*[\]］]', translated_text, re.IGNORECASE)
+        if residual_tags:
+            if tag_map_size == 0:
+                # TXT 모드(태그 없는 평문): Gemini가 프롬프트 예시를 흉내내어 [TAG_N]을 직접
+                # 출력한 것. 실제 HTML 태그와 무관하므로 오탐(false positive)으로 처리.
+                # → WARNING만 기록하고 검사 통과 (QC 재시도 루프를 발생시키지 않음)
+                logger.warning(
+                    f"Quality Check: [TAG_N] 잔여 감지 ({len(residual_tags)}개) — "
+                    f"tag_map=0 (TXT 모드)이므로 허상 플레이스홀더로 판정, 정리 후 통과. "
+                    f"잔여: {residual_tags[:5]}"
+                )
+                # translated_text 자체는 여기서 수정할 수 없지만,
+                # orchestrator에서 unmask_tags가 이미 제거했을 것이므로 통과 처리.
+            else:
+                issue = "TAG_UNMASK_CORRUPTED (잔여 [TAG_N] 플레이스홀더 감지)"
+                logger.warning(f"Quality Check Alert: {issue}")
+                return {
+                    "is_suspicious": True,
+                    "is_critical": True,
+                    "is_content_drop": False,
+                    "is_repetition": False,
+                    "is_tag_corrupted": True,
+                    "is_hallucination": False,
+                    "ratio": trans_len / src_len if src_len > 0 else 0.0,
+                    "issue": issue
+                }
 
         # 3.6. LLM Thinking / Meta monologue leak check
         if re.search(r'(?:Ah[!,.]?\s*I\s*see|Final\s*Polish\s*of\s*Korean|Ready\s*to\s*output|The\s*prompt\s*got\s*cut\s*off|<think|<thought)', translated_text, re.IGNORECASE):

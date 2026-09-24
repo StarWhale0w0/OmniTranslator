@@ -214,14 +214,57 @@ class TranslationOrchestrator(QtCore.QObject):
             masked_text, tag_map, pure_text = TagMasker.mask_tags(text_chunk)
             pure_len = len(pure_text.strip())
 
-            # 2. Pure Image / Media Instant Pass (< 10 translatable characters)
-            if pure_len < 10 and (BaseChunker.has_media_tags(text_chunk) or pure_len == 0):
-                logger.info(
-                    f"Chunk #{idx+1}: [순수 이미지/미디어 즉시 패스] "
-                    f"번역 대상 텍스트 {pure_len}자 (< 10자) -> API 호출 없이 원본 태그 즉시 반환"
+            # 2. Pure Whitespace / Tag-Only / Image / Non-CJK Navigation Instant Pass
+            # Condition A: 0 translatable chars (empty/nav/structural tags)
+            # Condition B: < 10 translatable chars with media tags (image-only chapter)
+            # Condition C: digits/spaces/punctuation ONLY — nav page-number link lists
+            #              e.g. "1 2 3 4 … 35", "36 37 … 69" from nav.xhtml
+            # Condition D: no CJK source chars, short text, more tags than chars
+            #              (structural nav/metadata block with no translatable content)
+            _has_media = BaseChunker.has_media_tags(text_chunk)
+            _pure_stripped = pure_text.strip()
+
+            _is_digits_only = (
+                bool(_pure_stripped) and
+                not re.search(
+                    r'[^\d\s\.\,\:\;\!\?\-\u2013\u2014\/\(\)\[\]\'\"\u3000\u300c\u300d\u3001\u3002]',
+                    _pure_stripped
                 )
-                self.signals.log_emitted.emit("INFO", f"Chunk #{idx+1}: [미디어 패스] 순수 이미지/삽화 챕터 즉시 바이패스")
-                self.signals.preview_updated.emit(text_chunk, "[표지/삽화 이미지 구간 - 바이패스됨]")
+            )
+            _has_cjk_source = bool(
+                re.search(r'[\u3040-\u309f\u30a0-\u30ff\u4e00-\u9fff]', _pure_stripped)
+            )
+            _is_structural_nav = (
+                not _has_cjk_source and
+                pure_len > 0 and
+                pure_len < 200 and
+                len(tag_map) > pure_len // 2
+            )
+
+            _is_passthrough = (
+                (pure_len == 0) or
+                (pure_len < 10 and _has_media) or
+                _is_digits_only or
+                _is_structural_nav
+            )
+            if _is_passthrough:
+                if pure_len == 0:
+                    _reason = "순수 공백/태그 전용 구간 (번역 대상 없음)"
+                elif pure_len < 10 and _has_media:
+                    _reason = f"순수 이미지/미디어 구간 ({pure_len}자 < 10자)"
+                elif _is_digits_only:
+                    _reason = f"숫자/기호 전용 구간 (nav 페이지 번호, {pure_len}자)"
+                else:
+                    _reason = f"CJK 원문 없는 구조적 내비게이션 구간 ({pure_len}자)"
+                logger.info(
+                    f"Chunk #{idx+1}: [즉시 패스스루] {_reason} "
+                    f"-> API 호출 없이 원본 즉시 반환"
+                )
+                self.signals.log_emitted.emit(
+                    "INFO",
+                    f"Chunk #{idx+1}: [패스스루] {_reason}"
+                )
+                self.signals.preview_updated.emit(text_chunk, f"[{_reason} - 바이패스됨]")
                 translated_dict[idx] = text_chunk
                 SessionManager.save_checkpoint(
                     input_path, output_path, language, 0, translated_dict, glossary_entries,
@@ -296,8 +339,28 @@ class TranslationOrchestrator(QtCore.QObject):
                         cleaned = TextCleaner.clean_text(result_raw, profile.get_cleaner_patterns())
                         
                         # Pre-unmask test to inspect tag integrity
+                        # unmask_tags now auto-strips residual [TAG_N] that cannot be mapped
                         test_unmasked = TagMasker.unmask_tags(cleaned, tag_map)
-                        qc_result = QualityChecker.inspect_chunk(masked_text, test_unmasked)
+
+                        # Extra safety: if tag_map is empty (TXT mode) but Gemini hallucinated
+                        # [TAG_N] tokens, strip them directly from both cleaned and test_unmasked
+                        if not tag_map and TagMasker.has_unmasked_placeholders(test_unmasked):
+                            logger.warning(
+                                f"Chunk #{idx+1}: TXT 모드 - Gemini가 [TAG_N] 허상 플레이스홀더 출력. "
+                                f"직접 제거 후 QC 진행."
+                            )
+                            test_unmasked = re.sub(
+                                r'\[\s*TAG\s*_?\s*\d[\d\s]*\s*\]', '', test_unmasked,
+                                flags=re.IGNORECASE
+                            ).strip()
+                            cleaned = re.sub(
+                                r'\[\s*TAG\s*_?\s*\d[\d\s]*\s*\]', '', cleaned,
+                                flags=re.IGNORECASE
+                            ).strip()
+
+                        qc_result = QualityChecker.inspect_chunk(
+                            masked_text, test_unmasked, tag_map_size=len(tag_map)
+                        )
 
                         # Track best Gemini candidate during retries
                         if cleaned.strip() and cleaned != masked_text:
@@ -488,46 +551,101 @@ class TranslationOrchestrator(QtCore.QObject):
             self.signals.status_changed.emit(f"EPUB 챕터 구조 분석 중... (총 {total_chapters}개 챕터)")
             global_chunk_idx = 0
 
-            for ch_idx, chapter in enumerate(chapters):
-                if self.cancel_requested:
-                    break
+            # ---------------------------------------------------------------
+            # Pre-scan: count total chunks from EPUB before starting translation.
+            # If checkpoint already covers ALL chunks (translated_dict has more
+            # entries than the actual EPUB chunk count), skip the translation loop
+            # and go directly to the EPUB rebuild step.  This prevents the
+            # "chunk #299 빈 응답/원문 반환" pattern that occurs when chunk_size
+            # was changed between runs or when a stale extra index exists in the
+            # checkpoint from a previous run.
+            # ---------------------------------------------------------------
+            total_epub_chunks = 0
+            for ch_pre in chapters:
+                rc_pre = ch_pre.get_content()
+                rh_pre = rc_pre.decode('utf-8', errors='ignore') if isinstance(rc_pre, bytes) else str(rc_pre)
+                sp_pre = BeautifulSoup(rh_pre, 'html.parser')
+                bd_pre = sp_pre.body if sp_pre.body else sp_pre
+                total_epub_chunks += len(
+                    DomChunker.chunk_body_preserving_structure(bd_pre, max_chars=configured_chunk_size)
+                )
 
-                raw_content = chapter.get_content()
-                raw_html = raw_content.decode('utf-8', errors='ignore') if isinstance(raw_content, bytes) else str(raw_content)
-                soup = BeautifulSoup(raw_html, 'html.parser')
-                body = soup.body if soup.body else soup
+            already_done = len(translated_dict)
+            logger.info(
+                f"EPUB 청크 사전 집계: 실제 청크 수={total_epub_chunks}, "
+                f"체크포인트 완료={already_done}"
+            )
 
-                # DOM preserving recursive chunking
-                chunk_tags = DomChunker.chunk_body_preserving_structure(body, max_chars=configured_chunk_size)
-                
-                ch_tasks = []
-                for chunk_tag in chunk_tags:
-                    chunk_str = str(chunk_tag)
-                    ch_tasks.append((global_chunk_idx, chunk_str))
-                    global_chunk_idx += 1
-
-                # Execute chapter chunks
-                ch_results = []
-                for g_idx, c_str in ch_tasks:
-                    if self.cancel_requested or not self.is_running:
+            if already_done >= total_epub_chunks:
+                # All chunks already translated — rebuild EPUB from checkpoint directly.
+                logger.info(
+                    f"[체크포인트 완전 재개] 체크포인트({already_done}개) >= "
+                    f"실제 EPUB 청크 수({total_epub_chunks}개). "
+                    f"Gemini 호출 없이 EPUB 재조립 단계로 직행합니다."
+                )
+                self.signals.log_emitted.emit(
+                    "INFO",
+                    f"[체크포인트 완전 재개] 모든 청크 번역 완료 확인 "
+                    f"({already_done}/{total_epub_chunks}). EPUB 재조립 중..."
+                )
+                self.signals.status_changed.emit(
+                    f"번역 완료 (체크포인트): EPUB 재조립 중... ({already_done}개 청크)"
+                )
+                # Reconstruct each chapter HTML from checkpoint
+                flat_idx = 0
+                for ch_rebuild in chapters:
+                    rc_r = ch_rebuild.get_content()
+                    rh_r = rc_r.decode('utf-8', errors='ignore') if isinstance(rc_r, bytes) else str(rc_r)
+                    sp_r = BeautifulSoup(rh_r, 'html.parser')
+                    bd_r = sp_r.body if sp_r.body else sp_r
+                    ctags_r = DomChunker.chunk_body_preserving_structure(bd_r, max_chars=configured_chunk_size)
+                    ch_translated_r = []
+                    for _ in ctags_r:
+                        ch_translated_r.append(translated_dict.get(flat_idx, str(_)))
+                        flat_idx += 1
+                    rebuilt_r = EpubIO.rebuild_chapter_html(rh_r, ch_translated_r)
+                    ch_rebuild.set_content(rebuilt_r.encode('utf-8'))
+            else:
+                for ch_idx, chapter in enumerate(chapters):
+                    if self.cancel_requested:
                         break
-                    res = await translate_single_chunk(g_idx, c_str)
-                    if res is None or self.cancel_requested or not self.is_running:
-                        break
-                    ch_results.append(res)
+
+                    raw_content = chapter.get_content()
+                    raw_html = raw_content.decode('utf-8', errors='ignore') if isinstance(raw_content, bytes) else str(raw_content)
+                    soup = BeautifulSoup(raw_html, 'html.parser')
+                    body = soup.body if soup.body else soup
+
+                    # DOM preserving recursive chunking
+                    chunk_tags = DomChunker.chunk_body_preserving_structure(body, max_chars=configured_chunk_size)
                     
-                    self.signals.progress.emit(
-                        len(translated_dict),
-                        global_chunk_idx,
-                        f"챕터 {ch_idx+1}/{total_chapters} 번역 중... ({len(translated_dict)} 청크 완료)"
-                    )
+                    ch_tasks = []
+                    for chunk_tag in chunk_tags:
+                        chunk_str = str(chunk_tag)
+                        ch_tasks.append((global_chunk_idx, chunk_str))
+                        global_chunk_idx += 1
 
-                if self.cancel_requested or not self.is_running or len(ch_results) < len(ch_tasks):
-                    break
+                    # Execute chapter chunks
+                    ch_results = []
+                    for g_idx, c_str in ch_tasks:
+                        if self.cancel_requested or not self.is_running:
+                            break
+                        res = await translate_single_chunk(g_idx, c_str)
+                        if res is None or self.cancel_requested or not self.is_running:
+                            break
+                        ch_results.append(res)
+                        
+                        self.signals.progress.emit(
+                            len(translated_dict),
+                            global_chunk_idx,
+                            f"챕터 {ch_idx+1}/{total_chapters} 번역 중... ({len(translated_dict)} 청크 완료)"
+                        )
 
-                # HTML DOM reconstruction per chapter
-                rebuilt_html = EpubIO.rebuild_chapter_html(raw_html, ch_results)
-                chapter.set_content(rebuilt_html.encode('utf-8'))
+                    if self.cancel_requested or not self.is_running or len(ch_results) < len(ch_tasks):
+                        break
+
+                    # HTML DOM reconstruction per chapter
+                    rebuilt_html = EpubIO.rebuild_chapter_html(raw_html, ch_results)
+                    chapter.set_content(rebuilt_html.encode('utf-8'))
 
             if not self.cancel_requested and self.is_running:
                 self.signals.status_changed.emit("목차(TOC) 및 네비게이션 메타데이터 한국어 동기화 중...")

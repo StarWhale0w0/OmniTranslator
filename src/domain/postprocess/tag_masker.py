@@ -12,7 +12,7 @@ class TagMasker:
     """Isolates HTML/XML/Media tags as [TAG_N] placeholders to protect them from LLM modification/censorship."""
 
     TAG_REGEX = re.compile(r'<[^>]+>', re.DOTALL)
-    PLACEHOLDER_REGEX = re.compile(r'\[\s*TAG\s*_?\s*[0-9][0-9\s]*\s*\]', re.IGNORECASE)
+    PLACEHOLDER_REGEX = re.compile(r'[\[［]\s*TAG\s*[_\-\s]*[0-9][0-9\s]*\s*[\]］]', re.IGNORECASE)
     IGNORED_TAGS = {'head', 'title', 'meta', 'link', 'style', 'script'}
 
     @classmethod
@@ -22,12 +22,15 @@ class TagMasker:
         Examples:
           [TAG_1 3] -> [TAG_13]
           [ TAG _ 0 ] -> [TAG_0]
-          [tag_ 5] -> [TAG_5]
+          ［TAG_0］ -> [TAG_0]
+          [tag- 5] -> [TAG_5]
           [TAG 2 0] -> [TAG_20]
           [tag1] -> [TAG_1]
         """
         if not text:
             return ""
+
+        text = cls.normalize_fullwidth_brackets(text)
 
         def replacer(m):
             raw_digits = m.group(1)
@@ -36,8 +39,8 @@ class TagMasker:
                 return f"[TAG_{num_clean}]"
             return m.group(0)
 
-        # Matches [TAG_1 3], [ TAG _ 0 ], [tag 5], [TAG10], etc.
-        pattern = re.compile(r'\[\s*TAG\s*_?\s*([0-9][0-9\s]*)\s*\]', re.IGNORECASE)
+        # Matches [TAG_1 3], [ TAG _ 0 ], [tag 5], [TAG-10], ［TAG_0］, etc.
+        pattern = re.compile(r'[\[［]\s*TAG\s*[_\-\s]*([0-9][0-9\s]*)\s*[\]］]', re.IGNORECASE)
         return pattern.sub(replacer, text)
 
     @classmethod
@@ -93,36 +96,73 @@ class TagMasker:
             return html.unescape(clean).strip()
 
     @classmethod
+    def normalize_fullwidth_brackets(cls, text: str) -> str:
+        """
+        전각 괄호(［, ］)를 반각 괄호([, ])로 변환하여
+        ［TAG_0］ → [TAG_0] 형태로 정규화한다.
+        """
+        if not text:
+            return text
+        return text.replace('［', '[').replace('］', ']')
+
+    @classmethod
     def unmask_tags(cls, translated_masked_text: str, tag_map: Dict[str, str]) -> str:
         """
         Restores [TAG_N] placeholders back to original HTML tags.
-        Handles variations in casing/spacing produced by LLMs and translators (e.g. [tag_0], [ TAG _ 0 ], [TAG_ 0], [TAG_1 3]).
+        Handles variations produced by LLMs:
+          - Casing:         [tag_0], [Tag_0]
+          - Spacing:        [ TAG _ 0 ], [TAG_ 0], [TAG_1 3]
+          - Fullwidth:      ［TAG_0］
+          - Hyphen:         [TAG-0], [tag-0]
+          - No separator:   [TAG0]
+        After substitution, any residual placeholder that could not be mapped
+        to a tag_map entry is stripped out (removed) so that QualityChecker
+        never sees leftover [TAG_N] artifacts when the source had no real tags.
         """
-        if not translated_masked_text or not tag_map:
+        if not translated_masked_text:
             return translated_masked_text
 
-        # 1. Normalize mutated placeholders first (e.g. [TAG_1 3] -> [TAG_13])
-        normalized_text = cls.normalize_placeholders(translated_masked_text)
-        result = normalized_text
+        # 0. Normalize fullwidth brackets and mutated placeholders first
+        text = cls.normalize_placeholders(translated_masked_text)
 
-        # 2. Exact and flexible tag substitution pass
+        if not tag_map:
+            # No tags to restore — strip any residual [TAG_N] and return
+            text = cls.PLACEHOLDER_REGEX.sub('', text)
+            return text
+
+        # Build direct number-to-tag map for safe fallback
+        num_to_tag: Dict[int, str] = {}
+        for placeholder, original_tag in tag_map.items():
+            m = re.search(r'\d+', placeholder)
+            if m:
+                num_to_tag[int(m.group(0))] = original_tag
+
+        result = text
+
+        # 1. Exact and flexible tag substitution pass
         for placeholder, original_tag in tag_map.items():
             num_match = re.search(r'\d+', placeholder)
             if num_match:
                 num = num_match.group(0)
-                pattern = re.compile(rf'\[\s*TAG\s*_?\s*{num}\s*\]', re.IGNORECASE)
+                pattern = re.compile(rf'[\[［]\s*TAG\s*[_\-\s]*{num}\s*[\]］]', re.IGNORECASE)
                 result = pattern.sub(lambda m, tag=original_tag: tag, result)
 
-        # 3. Fuzzy fallback pass for any remaining loose placeholder matches
+        # 2. Fuzzy fallback pass for any remaining loose placeholder matches
         def fuzzy_sub(m):
             raw_digits = m.group(1)
             clean_num = re.sub(r'\s+', '', raw_digits)
-            std_ph = f"[TAG_{clean_num}]"
-            if std_ph in tag_map:
-                return tag_map[std_ph]
-            return m.group(0)
+            if clean_num.isdigit():
+                val = int(clean_num)
+                if val in num_to_tag:
+                    return num_to_tag[val]
+            # Unmapped / hallucinated placeholder → remove it cleanly
+            return ''
 
-        fuzzy_pattern = re.compile(r'\[\s*TAG\s*_?\s*([0-9][0-9\s]*)\s*\]', re.IGNORECASE)
+        fuzzy_pattern = re.compile(r'[\[［]\s*TAG\s*[_\-\s]*([0-9][0-9\s]*)\s*[\]］]', re.IGNORECASE)
         result = fuzzy_pattern.sub(fuzzy_sub, result)
 
+        # 3. Final cleanup: strip any remaining [TAG_N] placeholders
+        result = cls.PLACEHOLDER_REGEX.sub('', result)
+
         return result
+
