@@ -323,6 +323,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self.progress_bar.setValue(processed)
         self.status_label.setText(msg)
 
+    def _notify_user_completion(self):
+        """Safely plays notification sound and alerts/flashes window/taskbar without raising exceptions."""
+        try:
+            import winsound
+            winsound.MessageBeep(winsound.MB_ICONASTERISK)
+        except Exception:
+            try:
+                QtWidgets.QApplication.beep()
+            except Exception:
+                pass
+
+        try:
+            QtWidgets.QApplication.alert(self, 0)
+        except Exception:
+            pass
+
     def _on_status(self, msg: str):
         self.status_label.setText(msg)
 
@@ -331,6 +347,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pause_btn.setEnabled(False)
         self.cancel_btn.setEnabled(False)
         if success:
+            self._notify_user_completion()
             QtWidgets.QMessageBox.information(self, "완료", info)
         else:
             QtWidgets.QMessageBox.warning(self, "알림", info)
@@ -338,15 +355,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_glossary_completed(self, success: bool, file_path_str: str, terms_count: int):
         """Plays completion sound, flashes taskbar, and shows modal popup when glossary extraction completes."""
         if success:
-            # 1. Beep Sound Notification
-            try:
-                import winsound
-                winsound.MessageBeep(winsound.MB_ICONASTERISK)
-            except Exception:
-                QtWidgets.QApplication.beep()
-
-            # 2. Window alert / Taskbar Flash
-            self.alert(0)
+            # 1 & 2. Sound notification and Taskbar Flash
+            self._notify_user_completion()
 
             # 3. Informational Message Box
             fname = Path(file_path_str).name
