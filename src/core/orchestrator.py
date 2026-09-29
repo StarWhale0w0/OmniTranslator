@@ -456,30 +456,125 @@ class TranslationOrchestrator(QtCore.QObject):
                         else:
                             break
 
-                # 4.4. Fail-Fast Hard Stop: Never save defective or untranslated chunks to checkpoint
+                # 4.4. Safe Fallback Safeguard: 4회 재시도 실패 시 강제 중단 대신
+                #      3단계 세이프가드를 통해 최선 결과를 저장하고 다음 청크로 진행.
                 if not gemini_success:
                     last_issue = qc_result.get("issue", "품질 검사 미달") if 'qc_result' in locals() else "Gemini 응답 부재"
-                    abort_reason = f"Chunk #{idx+1} 치명적 품질 결함 ({last_issue}) - Gemini {max_gemini_qc_retries}회 재시도 실패"
-                    logger.error(f"[FAIL-FAST ABORT] {abort_reason}. 체크포인트 오염 방지를 위해 번역 파이프라인을 즉시 안전 중단합니다.")
-                    
-                    self.cancel_requested = True
-                    self.is_running = False
-                    
+                    warn_prefix = f"[품질경고:{last_issue[:40]}]"
+
                     self.signals.log_emitted.emit(
-                        "ERROR",
-                        f"🚨 [긴급 강제 중단] Chunk #{idx+1}: {last_issue}\n"
-                        f"미번역 한자 잔존 또는 품질 결함으로 데이터 오염을 방지하기 위해 작업을 즉시 중단했습니다. (체크포인트 보존)"
+                        "WARNING",
+                        f"⚠️ Chunk #{idx+1}: Gemini {max_gemini_qc_retries}회 재시도 실패 ({last_issue}). "
+                        f"3단계 세이프가드 진행..."
                     )
-                    self.signals.status_changed.emit("품질 기준 미달로 안전을 위해 번역 프로세스를 강제 중단합니다")
-                    self.signals.completed.emit(
-                        False,
-                        f"[번역 긴급 중단]\n\n"
-                        f"청크 #{idx+1}에서 품질 기준에 미달하는 결함이 감지되었습니다.\n"
-                        f"사유: {last_issue}\n\n"
-                        f"불량 데이터의 체크포인트 기록을 방지하고 데이터 무결성을 보호하기 위해 번역 프로세스를 안전하게 강제 중단했습니다.\n"
-                        f"API 키 상태를 점검하거나 프롬프트를 확인한 후 다시 시작해 주세요."
+                    logger.warning(
+                        f"Chunk #{idx+1}: QC {max_gemini_qc_retries}회 실패 ({last_issue}). "
+                        f"Safe Fallback Safeguard 진입."
                     )
-                    return None
+
+                    # ── 세이프가드 1단계: 잔존 한자 → 한글 독음 강제 변환 ───────────────────
+                    # best_gemini_candidate가 있고 HANJA 관련 이슈인 경우, 한자를 독음으로 치환
+                    safeguard_text = best_gemini_candidate if best_gemini_candidate.strip() else masked_text
+                    hanja_in_safe = re.findall(r'[\u4e00-\u9fff]', safeguard_text)
+                    if hanja_in_safe and "HANJA" in str(last_issue).upper():
+                        # 간이 한자→한글독음 매핑 (중요 무협 관련 자주 출현 한자 중심)
+                        _HANJA_KO_READING = {
+                            '陽': '양', '剛': '강', '霸': '패', '絕': '절', '陰': '음',
+                            '柔': '유', '玄': '현', '逸': '일', '天': '천', '地': '지',
+                            '人': '인', '道': '도', '武': '무', '功': '공', '劍': '검',
+                            '刀': '도', '拳': '권', '掌': '장', '氣': '기', '力': '력',
+                            '神': '신', '魔': '마', '仙': '선', '龍': '용', '虎': '호',
+                            '鳳': '봉', '鶴': '학', '雷': '뇌', '火': '화', '水': '수',
+                            '風': '풍', '雲': '운', '山': '산', '海': '해', '星': '성',
+                            '月': '월', '日': '일', '金': '금', '木': '목', '土': '토',
+                            '心': '심', '法': '법', '術': '술', '式': '식', '訣': '결',
+                            '境': '경', '界': '계', '宗': '종', '派': '파', '門': '문',
+                            '經': '경', '典': '전', '丹': '단', '靈': '영', '寶': '보',
+                        }
+                        def _hanja_to_reading(ch):
+                            return _HANJA_KO_READING.get(ch, ch)
+
+                        converted = re.sub(
+                            r'[\u4e00-\u9fff]',
+                            lambda m: _hanja_to_reading(m.group(0)),
+                            safeguard_text
+                        )
+                        remaining = re.findall(r'[\u4e00-\u9fff]', converted)
+                        if len(remaining) < len(hanja_in_safe):
+                            logger.warning(
+                                f"Chunk #{idx+1}: [세이프가드-1] 한자 독음 변환 "
+                                f"{len(hanja_in_safe) - len(remaining)}자 처리. "
+                                f"잔여 {len(remaining)}자."
+                            )
+                            safeguard_text = converted
+                            self.signals.log_emitted.emit(
+                                "WARNING",
+                                f"Chunk #{idx+1}: [세이프가드-1] 잔존 한자 "
+                                f"{len(hanja_in_safe) - len(remaining)}자 독음 변환 적용"
+                            )
+
+                    # ── 세이프가드 2단계: FallbackTranslator(구글 번역 등) 최종 시도 ──────────
+                    fallback_success = False
+                    try:
+                        pure_src = TagMasker.unmask_tags(masked_text, tag_map)
+                        clean_src_for_fb = QualityChecker.extract_clean_text(pure_src)
+                        if clean_src_for_fb.strip():
+                            fb_result = await FallbackTranslator.translate_async(
+                                clean_src_for_fb,
+                                source_lang=language.upper(),
+                                target_lang="KO"
+                            )
+                            if fb_result and fb_result.strip() and fb_result.strip() != clean_src_for_fb.strip():
+                                # FallbackTranslator 성공 시 이를 우선 사용
+                                safeguard_text = fb_result
+                                fallback_success = True
+                                logger.warning(
+                                    f"Chunk #{idx+1}: [세이프가드-2] FallbackTranslator 번역 성공 "
+                                    f"({len(fb_result)}자). 폴백 결과 사용."
+                                )
+                                self.signals.log_emitted.emit(
+                                    "WARNING",
+                                    f"Chunk #{idx+1}: [세이프가드-2] FallbackTranslator 폴백 성공 → 다음 청크 계속 진행"
+                                )
+                    except Exception as fb_err:
+                        logger.warning(f"Chunk #{idx+1}: [세이프가드-2] FallbackTranslator 실패: {fb_err}")
+
+                    # ── 세이프가드 3단계: 최선 후보 + 경고 태그 삽입 후 저장, 다음 청크 진행 ──
+                    if not fallback_success:
+                        # 최선 후보(독음 변환 적용된 safeguard_text)에 경고 태그 삽입
+                        remaining_hanja = re.findall(r'[\u4e00-\u9fff]', safeguard_text)
+                        if remaining_hanja:
+                            safe_note = f"\n<!-- [번역경고] 한자 {len(remaining_hanja)}자 미변환 잔존({last_issue[:60]}) -->\n"
+                        else:
+                            safe_note = f"\n<!-- [번역경고] QC {max_gemini_qc_retries}회 실패({last_issue[:60]}) -->\n"
+                        safeguard_text = safe_note + safeguard_text
+                        logger.warning(
+                            f"Chunk #{idx+1}: [세이프가드-3] 경고 태그 삽입 후 저장 → 다음 청크 계속 진행."
+                        )
+                        self.signals.log_emitted.emit(
+                            "WARNING",
+                            f"Chunk #{idx+1}: [세이프가드-3] 경고 태그 삽입 후 저장 → Chunk #{idx+2}부터 번역 재개"
+                        )
+
+                    # 태그 언마스크 & 최종 후처리
+                    if fallback_success:
+                        # 폴백 결과는 순수 텍스트이므로 원본 태그 구조로 감싸지 않음
+                        final_safeguard = safeguard_text
+                    else:
+                        final_safeguard = TagMasker.unmask_tags(safeguard_text, tag_map)
+                    if not is_epub:
+                        final_safeguard = TextCleaner.strip_html_tags(final_safeguard)
+                    if not final_safeguard.strip():
+                        final_safeguard = text_chunk  # 최후 보루: 원문 보존
+
+                    translated_dict[idx] = final_safeguard
+                    self.signals.preview_updated.emit(text_chunk, final_safeguard)
+                    SessionManager.save_checkpoint(
+                        input_path, output_path, language, 0, translated_dict, glossary_entries,
+                        toc=toc_entries, book_title=book_title
+                    )
+                    logger.info(f"Chunk #{idx+1}: 세이프가드 저장 완료. Chunk #{idx+2}부터 계속 진행.")
+                    return final_safeguard
 
                 # 4.5. Glossary Post-Correction & Korean Josa Repair
                 if glossary_entries and use_glossary:

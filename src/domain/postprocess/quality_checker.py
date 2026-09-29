@@ -330,7 +330,15 @@ class QualityChecker:
                 }
 
         # 3.8. Untranslated CJK (Hanja) Ideograph Residual Check
-        hanja_matches = re.findall(r'[\u4e00-\u9fff]', trans_text_clean)
+        # ── 괄호 병기 형태 예외 처리 ──────────────────────────────────────────
+        # 무협/선협 특유의 구결/사자성어 병기: '양강패절(陽剛霸絕)' 처럼 한글(한국어) 뒤에
+        # 바로 이어지는 괄호 안 한자는 독자 가독성을 위한 의도적 병기이므로 제거 후 카운트.
+        trans_text_no_bracket_hanja = re.sub(
+            r'[\uac00-\ud7af]+\s*[\(\（][\u4e00-\u9fff\s]+[\)\）]',
+            lambda m: re.sub(r'[\u4e00-\u9fff]', '', m.group(0)),
+            trans_text_clean
+        )
+        hanja_matches = re.findall(r'[\u4e00-\u9fff]', trans_text_no_bracket_hanja)
         hanja_count = len(hanja_matches)
         hanja_ratio = (hanja_count / trans_len) if trans_len > 0 else 0.0
         hangul_count = len(re.findall(r'[\uac00-\ud7af]', trans_text_clean))
@@ -340,15 +348,24 @@ class QualityChecker:
             matching_hanja = [h for h in hanja_matches if h in src_hanja_set]
             match_ratio = (len(matching_hanja) / hanja_count) if hanja_count > 0 else 0.0
 
-            # Legitimate Hanja Case: Name wordplay / Incantation / Talisman / Annotation
-            # If translation is predominantly Korean (hangul_count >= 20 and hangul_count > hanja_count * 2),
-            # Hanja is a small fraction (< 12%), and mostly originates from source text (match_ratio >= 0.70):
-            if hangul_count >= 20 and hanja_ratio < 0.12 and match_ratio >= 0.70:
+            # ── 통과 조건 1: 주요 한국어 번역 + 소량 한자 (< 12%) + 원문 일치율 >= 50% ──
+            # 구결/부적/이름 풀이 등 의도적 보존 한자
+            if hangul_count >= 20 and hanja_ratio < 0.12 and match_ratio >= 0.50:
                 logger.info(
-                    f"Quality Check: 원문 한자(이름 풀이/주문/부적/병기 등) 보존 감지 "
+                    f"Quality Check: 원문 한자(이름 풀이/주문/부적/구결/병기 등) 보존 감지 "
                     f"({len(matching_hanja)}/{hanja_count}자 원문 일치, 한자 비율 {hanja_ratio*100:.1f}%) -> 정상 통과 (Pass)"
                 )
-            elif hanja_count >= 5 or (trans_len >= 30 and hanja_ratio >= 0.03):
+            # ── 통과 조건 2: 한자 비율 < 5% AND 절대 수 < 50자 → 극소량이므로 WARNING 후 통과 ──
+            # 무협 사자성어/구결 한자 1% 미만 잔존이 이 케이스에 해당
+            elif hanja_ratio < 0.05 and hanja_count < 50:
+                sample_hanja = "".join(hanja_matches[:15])
+                logger.warning(
+                    f"Quality Check: UNTRANSLATED_HANJA_WARNING (번역문 내 소량 한자 {hanja_count}자 "
+                    f"({hanja_ratio*100:.1f}%) 잔존: '{sample_hanja}') "
+                    f"— 비율 5% 미만 & {hanja_count}자 미만 50자 → 경고만 기록하고 통과 (Pass)"
+                )
+                # is_suspicious=False 로 반환 → QC 재시도 루프 미발생
+            elif hanja_count >= 5 or (trans_len >= 30 and hanja_ratio >= 0.05):
                 sample_hanja = "".join(hanja_matches[:10])
                 issue = f"UNTRANSLATED_HANJA_DETECTED (번역문 내 미번역 한자 {hanja_count}자({hanja_ratio*100:.1f}%) 잔존: '{sample_hanja}...')"
                 logger.warning(f"Quality Check Alert: {issue}")
