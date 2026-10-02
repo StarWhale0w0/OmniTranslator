@@ -199,12 +199,55 @@ class SessionManager:
             return False
 
     @classmethod
-    def remove_checkpoint(cls, input_file_path: Path) -> None:
-        """Removes metadata checkpoint file."""
-        meta_path = cls.get_meta_filepath(input_file_path)
-        if meta_path.exists():
+    def cleanup_checkpoint(cls, input_file_path: Path) -> List[Path]:
+        """
+        Safely removes all temporary metadata and checkpoint files associated with input_file_path.
+        Guarantees that *.glossary.json is NEVER deleted as it is a permanent asset.
+        Returns the list of successfully removed file paths.
+        """
+        parent_dir = input_file_path.parent
+        fname = input_file_path.name
+        fstem = input_file_path.stem
+
+        # Explicit candidate paths
+        candidate_paths = {
+            cls.get_meta_filepath(input_file_path),
+            cls.get_meta_filepath(input_file_path).with_suffix(".tmp"),
+            parent_dir / f"{fname}.meta.tmp",
+            parent_dir / f"{fname}.checkpoint.json",
+            parent_dir / f"{fname}.checkpoint.tmp",
+            parent_dir / f"{fstem}.meta.json",
+            parent_dir / f"{fstem}.checkpoint.json",
+        }
+
+        # Dynamic search in parent directory for matching temp/checkpoint files
+        try:
+            for p in parent_dir.glob(f"{fname}*.meta*"):
+                candidate_paths.add(p)
+            for p in parent_dir.glob(f"{fname}*.checkpoint*"):
+                candidate_paths.add(p)
+        except Exception as glob_err:
+            logger.warning(f"Failed to glob temporary files in {parent_dir}: {glob_err}")
+
+        removed_files: List[Path] = []
+        for target in candidate_paths:
+            # 절대 삭제 금지: *.glossary.json (영구 보존 자산)
+            if target.name.endswith(".glossary.json"):
+                continue
+
             try:
-                meta_path.unlink()
-                logger.info(f"Removed metadata checkpoint: {meta_path}")
+                if target.exists() and target.is_file():
+                    target.unlink()
+                    removed_files.append(target)
+                    logger.debug(f"Removed temporary checkpoint file: {target}")
             except Exception as e:
-                logger.error(f"Failed to remove checkpoint: {e}")
+                logger.warning(f"Could not remove temporary checkpoint file ({target}): {e}")
+
+        if removed_files:
+            logger.info(f"Cleaned up {len(removed_files)} temporary checkpoint file(s) for {fname}")
+        return removed_files
+
+    @classmethod
+    def remove_checkpoint(cls, input_file_path: Path) -> None:
+        """Removes metadata checkpoint file (delegates to cleanup_checkpoint)."""
+        cls.cleanup_checkpoint(input_file_path)

@@ -293,7 +293,7 @@ class MainWindow(QtWidgets.QMainWindow):
         lang = self.current_source_lang
         
         if self.loop:
-            asyncio.run_coroutine_threadsafe(
+            fut = asyncio.run_coroutine_threadsafe(
                 self.orchestrator.run_pipeline_async(
                     input_path=p_in,
                     output_path=Path(out_path),
@@ -302,7 +302,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 ),
                 self.loop
             )
-
+            def _on_pipeline_done(future):
+                try:
+                    future.result()
+                except Exception as exc:
+                    logger.error(f"Pipeline uncaught background exception: {exc}", exc_info=True)
+                    self.signals.completed.emit(False, f"번역 프로세스 예외 발생:\n{exc}")
+            fut.add_done_callback(_on_pipeline_done)
 
     def _pause_translation(self):
         if self.orchestrator.is_paused:
@@ -316,7 +322,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.orchestrator.cancel()
         self.start_btn.setEnabled(True)
         self.pause_btn.setEnabled(False)
+        self.pause_btn.setText("⏸️ 일시 정지")
         self.cancel_btn.setEnabled(False)
+        self.status_label.setText("작업 취소됨")
 
     def _on_progress(self, processed: int, total: int, msg: str):
         self.progress_bar.setRange(0, total if total > 0 else 100)
@@ -345,11 +353,16 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_completed(self, success: bool, info: str):
         self.start_btn.setEnabled(True)
         self.pause_btn.setEnabled(False)
+        self.pause_btn.setText("⏸️ 일시 정지")
         self.cancel_btn.setEnabled(False)
         if success:
+            if self.progress_bar.maximum() > 0:
+                self.progress_bar.setValue(self.progress_bar.maximum())
+            self.status_label.setText("🎉 번역 작업 완료!")
             self._notify_user_completion()
             QtWidgets.QMessageBox.information(self, "완료", info)
         else:
+            self.status_label.setText("번역 실패 또는 중단됨")
             QtWidgets.QMessageBox.warning(self, "알림", info)
 
     def _on_glossary_completed(self, success: bool, file_path_str: str, terms_count: int):

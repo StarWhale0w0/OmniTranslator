@@ -39,6 +39,16 @@ class GeminiClient:
             self.client_pool[api_key] = genai.Client(api_key=api_key)
         return self.client_pool[api_key]
 
+    def close(self):
+        """Closes and clears any pooled client resources."""
+        for client in list(self.client_pool.values()):
+            try:
+                if hasattr(client, 'close') and callable(client.close):
+                    client.close()
+            except Exception:
+                pass
+        self.client_pool.clear()
+
     @classmethod
     def get_default_safety_settings(cls) -> List[genai_types.SafetySetting]:
         """

@@ -82,6 +82,14 @@ class TranslationOrchestrator(QtCore.QObject):
         self.is_running = False
         self.signals.status_changed.emit("작업 취소 요청됨...")
 
+    def cleanup(self):
+        """Cleans up ongoing sessions, key managers, or client pools."""
+        if hasattr(self, 'gemini_client') and self.gemini_client:
+            try:
+                self.gemini_client.close()
+            except Exception as e:
+                logger.warning(f"Error during gemini_client cleanup: {e}")
+
     async def extract_glossary_async(self, input_path: Path, language: str):
         """Extracts AI glossary from entire document text asynchronously using Map-Reduce scanner."""
         if not input_path.exists():
@@ -171,7 +179,7 @@ class TranslationOrchestrator(QtCore.QObject):
         language: str,
         active_glossary: Optional[List[Dict[str, Any]]] = None,
         resume_existing: bool = True
-    ):
+    ) -> Optional[Path]:
         """
         Executes SeaMarine / Novel Batch Translation pipeline:
         Tag Masking -> Pure Image Instant Pass -> Gemini Translation -> 2nd Fallback (GoogleTranslator) -> Tag Unmasking.
@@ -180,6 +188,40 @@ class TranslationOrchestrator(QtCore.QObject):
         self.is_paused = False
         self.cancel_requested = False
 
+        try:
+            return await self._run_pipeline_core(
+                input_path=input_path,
+                output_path=output_path,
+                language=language,
+                active_glossary=active_glossary,
+                resume_existing=resume_existing
+            )
+        except asyncio.CancelledError:
+            logger.info("번역 파이프라인이 취소되었습니다.")
+            self.signals.status_changed.emit("번역 작업이 취소되었습니다.")
+            return None
+        except Exception as e:
+            import traceback as _tb
+            full_tb = _tb.format_exc()
+            logger.error(f"Translation pipeline failed: {e}\n[FULL TRACEBACK]\n{full_tb}")
+            self.signals.status_changed.emit(f"번역 실패: {e}")
+            for tb_line in full_tb.splitlines():
+                if tb_line.strip():
+                    self.signals.log_emitted.emit("ERROR", f"  {tb_line}")
+            self.signals.completed.emit(False, f"번역 중 오류가 발생했습니다:\n{e}")
+            return None
+        finally:
+            self.is_running = False
+            self.cleanup()
+
+    async def _run_pipeline_core(
+        self,
+        input_path: Path,
+        output_path: Path,
+        language: str,
+        active_glossary: Optional[List[Dict[str, Any]]] = None,
+        resume_existing: bool = True
+    ) -> Optional[Path]:
         self.signals.status_changed.emit("초기화 및 파일 로딩 중...")
         profile = self._get_profile(language)
         is_epub = input_path.suffix.lower() == ".epub"
@@ -781,26 +823,38 @@ class TranslationOrchestrator(QtCore.QObject):
                     chapter.set_content(rebuilt_html.encode('utf-8'))
 
             if not self.cancel_requested and self.is_running:
-                self.signals.status_changed.emit("목차(TOC) 및 네비게이션 메타데이터 한국어 동기화 중...")
+                self.signals.status_changed.emit("목차(TOC) 동기화 및 EPUB 파일 저장 중...")
                 logger.info("Synchronizing and applying translated TOC to EPUB and metadata...")
                 
-                # Apply synchronized TOC & Navigation (toc.ncx, nav.xhtml, book.toc, visual TOC pages, DC title)
-                final_toc_meta = EpubIO.save_epub(
-                    book=book,
-                    output_epub_path=output_path,
-                    toc_entries=toc_entries,
-                    book_title=book_title,
-                    input_file_path=input_path,
-                    language="ko",
-                    auto_sync_toc=True
+                # Apply synchronized TOC & Navigation and write EPUB file asynchronously
+                loop = asyncio.get_running_loop()
+                final_toc_meta = await loop.run_in_executor(
+                    None,
+                    lambda: EpubIO.save_epub(
+                        book=book,
+                        output_epub_path=output_path,
+                        toc_entries=toc_entries,
+                        book_title=book_title,
+                        input_file_path=input_path,
+                        language="ko",
+                        auto_sync_toc=True
+                    )
                 )
                 
+                logger.info(f"🎉 번역 및 EPUB 파일 생성이 완료되었습니다: {output_path}")
+                self.signals.log_emitted.emit("INFO", f"🎉 번역 및 EPUB 파일 생성이 완료되었습니다: {output_path}")
+                self.signals.status_changed.emit(f"EPUB 파일 저장 완료: {output_path.name}")
+
                 # Update checkpoint with final TOC metadata
-                SessionManager.update_toc_in_checkpoint(
-                    input_file_path=input_path,
-                    toc_entries=final_toc_meta,
-                    book_title=book.title
-                )
+                try:
+                    book_title_val = getattr(book, 'title', None) or book_title
+                    SessionManager.update_toc_in_checkpoint(
+                        input_file_path=input_path,
+                        toc_entries=final_toc_meta,
+                        book_title=book_title_val
+                    )
+                except Exception as _e_toc:
+                    logger.warning(f"체크포인트 TOC 업데이트 건너뜀: {_e_toc}")
 
         # =========================================================================
         # TXT PARSED WORKFLOW
@@ -823,15 +877,29 @@ class TranslationOrchestrator(QtCore.QObject):
             if not self.cancel_requested and self.is_running and len(results) == total_chunks:
                 final_text = "\n\n".join(results)
                 final_text = TextCleaner.strip_html_tags(final_text)
-                TxtIO.write_text_file(output_path, final_text)
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, lambda: TxtIO.write_text_file(output_path, final_text))
+                logger.info(f"🎉 번역 및 TXT 파일 생성이 완료되었습니다: {output_path}")
+                self.signals.log_emitted.emit("INFO", f"🎉 번역 및 TXT 파일 생성이 완료되었습니다: {output_path}")
+                self.signals.status_changed.emit(f"TXT 저장 완료: {output_path.name}")
 
         if self.cancel_requested or not self.is_running:
             self.is_running = False
-            return
+            return None
 
-        # Cleanup checkpoint on clean finish
-        SessionManager.remove_checkpoint(input_path)
+        # Cleanup temporary checkpoint & metadata files on clean finish
+        try:
+            SessionManager.cleanup_checkpoint(input_path)
+            logger.info("🧹 번역 완료: 임시 체크포인트 및 메타데이터 파일을 정리했습니다.")
+            self.signals.log_emitted.emit("INFO", "🧹 번역 완료: 임시 체크포인트 및 메타데이터 파일을 정리했습니다.")
+        except Exception as e_clean:
+            logger.warning(f"임시 체크포인트 파일 정리 중 경고 (무시됨): {e_clean}")
 
-        self.signals.progress.emit(len(translated_dict), len(translated_dict), "번역 완료!")
+        total_done = len(translated_dict)
+        self.signals.progress.emit(total_done, total_done, "번역 완료!")
+        self.signals.status_changed.emit("번역 작업이 성공적으로 완료되었습니다.")
+        logger.info(f"[INFO] Translation completed successfully: {output_path}")
+        self.signals.log_emitted.emit("INFO", f"[INFO] 번역 파이프라인 전체 완료: {output_path.name}")
         self.signals.completed.emit(True, f"성공적으로 번역되었습니다:\n{output_path}")
         self.is_running = False
+        return output_path
