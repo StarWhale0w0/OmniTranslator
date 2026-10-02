@@ -19,16 +19,19 @@ logger = setup_logger("GlossaryExtractor")
 class GlossaryExtractor:
     """Extracts terms from entire document text into unified JSON glossary using Gemini AI Map-Reduce pipeline with atomic checkpointing."""
 
-    PROMPT_TEMPLATE = (
-        "당신은 {lang_code} 원작 소설/문학의 최고 전문 번역가이자 고유명사 용어집 구축 전문가입니다.\n"
+    # NOTE: %PLACEHOLDER% 방식 사용 — str.format()을 쓰면 소설 본문 내 중괄호({})가
+    # 템플릿 슬롯으로 오인되어 'NoneType' object has no attribute 'get_template' 등의
+    # 예기치 않은 AttributeError / KeyError가 발생하므로 replace() 방식으로 교체함.
+    PROMPT_TEMPLATE_PARTS = (
+        "당신은 %LANG_CODE% 원작 소설/문학의 최고 전문 번역가이자 고유명사 용어집 구축 전문가입니다.\n"
         "제공된 본문 블록을 면밀히 분석하여 한국어 번역 시 일관성을 유지해야 하는 순수 고유명사만을 엄격하게 추출하십시오.\n\n"
         "## 추출 대상 카테고리 (순수 고유명사 한정):\n"
         "1. 인명 (주인공, 조연, 엑스트라 고유 이름, 풀네임, 고유 닉네임)\n"
         "2. 문파/세력/단체 (문파, 길드, 학원, 군단, 기업, 종족, 결사, 조직 등)\n"
         "3. 지명/장소 (국가, 도시, 고유 건물/던전, 지형, 차원, 영역 등)\n"
         "4. 무공/기술/아이템/설정 (고유 무공, 전용 스킬/마법, 고유 아이템, 유물, 특수 세계관 설정/시스템 등)\n\n"
-        "## {lang_code} 용어 추출 및 번역/음역 절대 원칙:\n"
-        "{rules}\n\n"
+        "## %LANG_CODE% 용어 추출 및 번역/음역 절대 원칙:\n"
+        "%RULES%\n\n"
         "## 필수 준수 지침 (고유명사 정밀 추출 및 불량 오염 절대 방지):\n"
         "1. [진정한 고유명사 한정]: 억지로 개수를 채우려 하지 마십시오. 본문에 실제로 존재하는 엄격한 고유명사만 정밀하게 추출하십시오.\n"
         "2. [추출 절대 금지 대상 - 위반 시 무효 처리]:\n"
@@ -39,12 +42,30 @@ class GlossaryExtractor:
         "3. 본문에 실제로 등장한 횟수(occurrence_count)를 최소 1 이상으로 정확히 기재하십시오.\n"
         "4. 반드시 아래 JSON 배열 형식으로만 응답하고, 마크다운 코드블록이나 부가 설명/사고 과정을 일체 포함하지 마십시오.\n\n"
         "## 소설 본문 블록:\n"
-        "```\n{text}\n```\n\n"
+        "```\n%TEXT%\n```\n\n"
         "## JSON 출력 형식:\n"
         "[\n"
-        '  {{"keyword": "원문고유명사", "translated_keyword": "한국어번역", "category": "인명/문파/세력/지명/무공/아이템/설정", "occurrence_count": 1}}\n'
+        '  {"keyword": "원문고유명사", "translated_keyword": "한국어번역", "category": "인명/문파/세력/지명/무공/아이템/설정", "occurrence_count": 1}\n'
         "]"
     )
+
+    @classmethod
+    def _build_prompt(cls, lang_code: str, rules: str, text: str) -> str:
+        """
+        소설 본문(text) 안에 중괄호({})가 포함되어 있어도 str.format()이
+        오작동하지 않도록 str.replace()로 안전하게 프롬프트를 조립합니다.
+
+        [버그 수정] 기존 PROMPT_TEMPLATE.format(lang_code=..., rules=..., text=block)
+        방식에서 block 내 '{variable}' 형태의 중괄호가 있을 경우
+        'NoneType' object has no attribute 'get_template' (Jinja2 내부 에러 유사 패턴)
+        또는 KeyError 가 발생하는 문제를 해결합니다.
+        """
+        return (
+            cls.PROMPT_TEMPLATE_PARTS
+            .replace("%LANG_CODE%", lang_code)
+            .replace("%RULES%", rules)
+            .replace("%TEXT%", text)
+        )
 
     LANG_RULES = {
         "ZH": (
@@ -452,13 +473,36 @@ class GlossaryExtractor:
         checkpoint_path: Optional[Path] = None
     ) -> List[Dict[str, Any]]:
         """Extracts terms from all text blocks with real-time atomic checkpoint saving and resumption."""
+        # ── [버그 방어] 입력 파라미터 None 가드 ──────────────────────────────────────
+        # lang_code가 None이면 lang_code.upper()에서 AttributeError가 발생하고,
+        # gemini_client가 None이면 generate_text_async 호출 시
+        # 'NoneType' object has no attribute 'get_template' 등의 오류가 발생함.
+        if not lang_code:
+            logger.warning(
+                "extract_glossary_from_text_async: lang_code가 None/빈값입니다. "
+                "기본값 'JA'로 대체합니다."
+            )
+            lang_code = "JA"
+        lang_code = str(lang_code).upper().strip() or "JA"
+
+        if gemini_client is None:
+            raise ValueError(
+                "extract_glossary_from_text_async: gemini_client가 None입니다. "
+                "Orchestrator 초기화 시 GeminiClient가 정상적으로 주입되었는지 확인하세요."
+            )
+
+        if not text_content or not str(text_content).strip():
+            logger.warning("extract_glossary_from_text_async: 빈 text_content가 전달되었습니다.")
+            return []
+        # ─────────────────────────────────────────────────────────────────────────────
+
         blocks = cls.split_into_blocks(text_content, block_size=block_size)
         total_blocks = len(blocks)
         if total_blocks == 0:
             logger.warning("Empty text provided for glossary extraction.")
             return []
 
-        rules = cls.LANG_RULES.get(lang_code.upper(), cls.LANG_RULES["JA"])
+        rules = cls.LANG_RULES.get(lang_code, cls.LANG_RULES["JA"])
         merged_glossary: Dict[str, Dict[str, Any]] = {}
         trans_counts: Dict[str, Dict[str, int]] = {}
         completed_blocks: List[int] = []
@@ -484,7 +528,7 @@ class GlossaryExtractor:
                 logger.info(f"Glossary block {idx}/{total_blocks} already in checkpoint. Bypassing...")
                 continue
 
-            prompt_str = cls.PROMPT_TEMPLATE.format(
+            prompt_str = cls._build_prompt(
                 lang_code=lang_code,
                 rules=rules,
                 text=block

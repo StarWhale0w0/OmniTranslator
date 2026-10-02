@@ -88,6 +88,39 @@ class TranslationOrchestrator(QtCore.QObject):
             self.signals.log_emitted.emit("ERROR", "용어 추출 실패: 입력 파일이 존재하지 않습니다.")
             return
 
+        # ── [버그 방어] gemini_client None 체크 + Lazy Loading ───────────────────────
+        # __init__에서 KeyManager / GeminiClient가 정상 생성되었는지 확인하고,
+        # None인 경우 Lazy Loading으로 재생성하여 'NoneType' 오류를 방지함.
+        if self.gemini_client is None:
+            logger.warning("[Orchestrator] gemini_client가 None입니다. Lazy Loading으로 재생성합니다.")
+            try:
+                self.key_manager = KeyManager(
+                    api_keys=self.config.get("api_keys", []),
+                    requests_per_minute=self.config.get("rpm_limit", 60),
+                    request_delay=self.config.get("request_delay", 0.5)
+                )
+                self.gemini_client = GeminiClient(self.key_manager)
+                logger.info("[Orchestrator] gemini_client Lazy Loading 성공.")
+            except Exception as lazy_err:
+                err_msg = f"GeminiClient 초기화 실패: {lazy_err}"
+                logger.error(f"[Orchestrator] {err_msg}")
+                self.signals.log_emitted.emit("ERROR", f"용어 추출 실패: {err_msg}")
+                self.signals.glossary_completed.emit(False, err_msg, 0)
+                return
+
+        if not self.config.get("api_keys"):
+            err_msg = "API 키가 등록되지 않았습니다. 설정 메뉴에서 Gemini API 키를 등록해주세요."
+            self.signals.log_emitted.emit("ERROR", err_msg)
+            self.signals.glossary_completed.emit(False, err_msg, 0)
+            return
+
+        # ── [버그 방어] language 값 정규화 ────────────────────────────────────────────
+        if not language:
+            language = self.config.get("source_lang", self.config.get("default_language", "JA"))
+            logger.warning(f"[Orchestrator] language 파라미터가 비어 있어 config 기본값 '{language}'로 대체합니다.")
+        language = str(language).upper().strip() or "JA"
+        # ─────────────────────────────────────────────────────────────────────────────
+
         self.signals.glossary_loading.emit(True, "문서 로드 및 분석 블록 분할 중...")
         self.signals.status_changed.emit("AI 용어집 전수 추출 준비 중...")
         self.signals.log_emitted.emit("INFO", f"AI 전수 용어 추출 시작: {input_path.name}")
@@ -121,9 +154,14 @@ class TranslationOrchestrator(QtCore.QObject):
             self.signals.glossary_completed.emit(True, str(glossary_file), len(entries))
 
         except Exception as e:
-            logger.error(f"Glossary extraction pipeline failed: {e}")
+            import traceback as _tb
+            full_tb = _tb.format_exc()
+            logger.error(f"Glossary extraction pipeline failed: {e}\n[FULL TRACEBACK]\n{full_tb}")
             self.signals.glossary_loading.emit(False, f"추출 실패: {e}")
-            self.signals.log_emitted.emit("ERROR", f"용어 추출 중 오류 발생: {e}")
+            # UI 로그에도 전체 traceback 출력 (라인별 분리)
+            for tb_line in full_tb.splitlines():
+                if tb_line.strip():
+                    self.signals.log_emitted.emit("ERROR", f"  {tb_line}")
             self.signals.glossary_completed.emit(False, str(e), 0)
 
     async def run_pipeline_async(

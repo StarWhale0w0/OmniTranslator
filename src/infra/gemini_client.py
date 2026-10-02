@@ -223,10 +223,19 @@ class GeminiClient:
             try:
                 sdk_client = self._get_sdk_client(api_key)
                 
-                # Configure thinking_budget only when explicitly positive to avoid 400 INVALID_ARGUMENT
+                # Configure thinking_budget:
+                # - None  → thinking_config 미설정 (SDK 기본값 사용)
+                # - 0     → 명시적으로 thinking 비활성화 (thinking_budget=0 전달)
+                # - > 0   → 지정된 예산으로 thinking 활성화
+                # NOTE: thinking_config=None을 SDK에 넘기면 일부 모델에서
+                # 내부 NoneType 처리 오류가 발생하므로 0인 경우도 명시 설정.
                 thinking_config = None
-                if thinking_budget is not None and thinking_budget > 0:
-                    thinking_config = genai_types.ThinkingConfig(thinking_budget=thinking_budget)
+                if thinking_budget is not None:
+                    if thinking_budget > 0:
+                        thinking_config = genai_types.ThinkingConfig(thinking_budget=thinking_budget)
+                    else:
+                        # thinking_budget=0 → thinking 명시적 비활성화
+                        thinking_config = genai_types.ThinkingConfig(thinking_budget=0)
 
                 # Standardized safety settings across 4 core categories
                 safety_settings = self.get_default_safety_settings()

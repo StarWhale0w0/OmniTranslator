@@ -103,6 +103,12 @@ class EpubIO:
                         file_name=zip_name,
                         media_type="application/xhtml+xml",
                     )
+                    # [핵심 버그 수정]
+                    # EpubHtml.get_content()는 내부에서 self.book.get_template()을 호출함.
+                    # 수동 생성된 EpubHtml은 self.book이 None으로 초기화되므로
+                    # get_content() 호출 시 'NoneType' object has no attribute 'get_template'
+                    # 에러가 발생함. item.book = book 으로 연결하면 완전히 해결됨.
+                    item.book = book
                     item.set_content(raw_bytes)
                     chapter_items.append(item)
                     known_names.add(zip_name)
@@ -126,7 +132,23 @@ class EpubIO:
         book, chapters = cls.get_epub_chapters(epub_path)
         text_parts = []
         for ch in chapters:
-            content = TOCProcessor.get_item_content_str(ch)
+            try:
+                content = TOCProcessor.get_item_content_str(ch)
+            except AttributeError as ae:
+                # [방어] EpubHtml.get_content() 내부의 self.book.get_template() 호출이
+                # book이 None인 fallback 아이템에서 실패할 때의 최후 방어.
+                # item.book = book 수정으로 정상 처리되지만, 혹시 모를 경우를 대비해
+                # item.content 원본 바이트를 직접 디코드해 텍스트 추출을 이어감.
+                logger.warning(
+                    f"extract_plain_text: get_item_content_str 실패 ({ae}). "
+                    f"item.content 직접 접근으로 폴백합니다."
+                )
+                raw = getattr(ch, 'content', b'') or b''
+                content = raw.decode('utf-8', errors='ignore') if isinstance(raw, bytes) else str(raw)
+            except Exception as ex:
+                logger.warning(f"extract_plain_text: 챕터 파싱 실패 ({ex}). 건너뜁니다.")
+                continue
+
             soup = BeautifulSoup(content, 'html.parser')
             cleaned = soup.get_text(separator='\n').strip()
             if cleaned:
