@@ -54,6 +54,16 @@ class TranslationOrchestrator(QtCore.QObject):
         self.is_paused = False
         self.cancel_requested = False
 
+        # Live session state tracking for graceful shutdown & flushing
+        self.current_input_path: Optional[Path] = None
+        self.current_output_path: Optional[Path] = None
+        self.current_language: str = "JA"
+        self.current_translated_dict: Dict[int, str] = {}
+        self.current_glossary_entries: List[Dict[str, Any]] = []
+        self.current_toc_entries: List[Dict[str, Any]] = []
+        self.current_book_title: Optional[str] = None
+        self.current_total_chunks: int = 0
+
         self.key_manager = KeyManager(
             api_keys=self.config.get("api_keys", []),
             requests_per_minute=self.config.get("rpm_limit", 60),
@@ -69,8 +79,32 @@ class TranslationOrchestrator(QtCore.QObject):
             return EnglishProfile()
         return JapaneseProfile()
 
+    def flush_checkpoint(self) -> None:
+        """Immediately flushes in-memory translation progress and checkpoint data to disk."""
+        if (
+            self.current_input_path and 
+            self.current_translated_dict is not None and 
+            len(self.current_translated_dict) > 0
+        ):
+            try:
+                out_path = self.current_output_path or (self.current_input_path.parent / f"{self.current_input_path.stem}_translated{self.current_input_path.suffix}")
+                SessionManager.save_checkpoint(
+                    input_file_path=self.current_input_path,
+                    output_file_path=out_path,
+                    language=self.current_language or "JA",
+                    total_chunks=self.current_total_chunks or 0,
+                    translated_chunks=self.current_translated_dict,
+                    glossary=self.current_glossary_entries or [],
+                    toc=self.current_toc_entries or [],
+                    book_title=self.current_book_title
+                )
+                logger.info(f"💾 Flushed {len(self.current_translated_dict)} chunks to checkpoint on disk.")
+            except Exception as e:
+                logger.error(f"Failed to flush checkpoint to disk: {e}")
+
     def pause(self):
         self.is_paused = True
+        self.flush_checkpoint()
         self.signals.status_changed.emit("일시 정지됨")
 
     def resume(self):
@@ -80,6 +114,7 @@ class TranslationOrchestrator(QtCore.QObject):
     def cancel(self):
         self.cancel_requested = True
         self.is_running = False
+        self.flush_checkpoint()
         self.signals.status_changed.emit("작업 취소 요청됨...")
 
     def cleanup(self):
@@ -273,6 +308,15 @@ class TranslationOrchestrator(QtCore.QObject):
         prefill_text = self.config.get("prefill_text", "").strip()
         configured_chunk_size = self.config.get("chunk_size", 2000)
 
+        # Sync live state attributes for immediate disk flush support
+        self.current_input_path = input_path
+        self.current_output_path = output_path
+        self.current_language = language
+        self.current_translated_dict = translated_dict
+        self.current_glossary_entries = glossary_entries
+        self.current_toc_entries = toc_entries
+        self.current_book_title = book_title
+
         # Helper: Async single chunk translation with SeaMarine Tag Masking & Multi-Key Failover
         async def translate_single_chunk(idx: int, text_chunk: str) -> str:
             if idx in translated_dict:
@@ -399,12 +443,11 @@ class TranslationOrchestrator(QtCore.QObject):
                             temperature=init_temp,
                             top_p=self.config.get("top_p", 0.9),
                             thinking_budget=None,
-                            system_instruction=current_sys_instruction,
-                            raw_fallback_text=masked_text
+                            system_instruction=current_sys_instruction
                         )
 
-                        # If Gemini returned raw fallback or empty text
-                        if result_raw == masked_text or not result_raw.strip():
+                        # If Gemini returned empty text
+                        if not result_raw or not result_raw.strip() or result_raw.strip() == masked_text.strip():
                             logger.warning(
                                 f"Chunk #{idx+1}: Gemini 빈 응답/원문 반환 (시도 {gemini_att+1}/{max_gemini_qc_retries}). "
                                 f"키 교체 후 Gemini 재시도..."
@@ -536,127 +579,81 @@ class TranslationOrchestrator(QtCore.QObject):
                         else:
                             break
 
-                # 4.4. Safe Fallback Safeguard: 4회 재시도 실패 시 강제 중단 대신
-                #      3단계 세이프가드를 통해 최선 결과를 저장하고 다음 청크로 진행.
+                # 4.4. Secondary Fallback: FallbackTranslator (Google Translator via GTX/deep-translator)
+                # Gemini 응답 부재 / 품질 미달 시 2차 폴백 번역을 즉시 호출
                 if not gemini_success:
                     last_issue = qc_result.get("issue", "품질 검사 미달") if 'qc_result' in locals() else "Gemini 응답 부재"
-                    warn_prefix = f"[품질경고:{last_issue[:40]}]"
-
+                    logger.warning(
+                        f"Chunk #{idx+1}: Gemini {max_gemini_qc_retries}회 재시도 실패 ({last_issue}). "
+                        f"2차 폴백 번역(구글 번역) 즉시 호출..."
+                    )
                     self.signals.log_emitted.emit(
                         "WARNING",
-                        f"⚠️ Chunk #{idx+1}: Gemini {max_gemini_qc_retries}회 재시도 실패 ({last_issue}). "
-                        f"3단계 세이프가드 진행..."
-                    )
-                    logger.warning(
-                        f"Chunk #{idx+1}: QC {max_gemini_qc_retries}회 실패 ({last_issue}). "
-                        f"Safe Fallback Safeguard 진입."
+                        f"⚠️ Chunk #{idx+1}: Gemini 시도 실패 ({last_issue}) -> 2차 폴백 번역(구글 번역) 호출 중..."
                     )
 
-                    # ── 세이프가드 1단계: 잔존 한자 → 한글 독음 강제 변환 ───────────────────
-                    # best_gemini_candidate가 있고 HANJA 관련 이슈인 경우, 한자를 독음으로 치환
-                    safeguard_text = best_gemini_candidate if best_gemini_candidate.strip() else masked_text
-                    hanja_in_safe = re.findall(r'[\u4e00-\u9fff]', safeguard_text)
-                    if hanja_in_safe and "HANJA" in str(last_issue).upper():
-                        # 간이 한자→한글독음 매핑 (중요 무협 관련 자주 출현 한자 중심)
-                        _HANJA_KO_READING = {
-                            '陽': '양', '剛': '강', '霸': '패', '絕': '절', '陰': '음',
-                            '柔': '유', '玄': '현', '逸': '일', '天': '천', '地': '지',
-                            '人': '인', '道': '도', '武': '무', '功': '공', '劍': '검',
-                            '刀': '도', '拳': '권', '掌': '장', '氣': '기', '力': '력',
-                            '神': '신', '魔': '마', '仙': '선', '龍': '용', '虎': '호',
-                            '鳳': '봉', '鶴': '학', '雷': '뇌', '火': '화', '水': '수',
-                            '風': '풍', '雲': '운', '山': '산', '海': '해', '星': '성',
-                            '月': '월', '日': '일', '金': '금', '木': '목', '土': '토',
-                            '心': '심', '法': '법', '術': '술', '式': '식', '訣': '결',
-                            '境': '경', '界': '계', '宗': '종', '派': '파', '門': '문',
-                            '經': '경', '典': '전', '丹': '단', '靈': '영', '寶': '보',
-                        }
-                        def _hanja_to_reading(ch):
-                            return _HANJA_KO_READING.get(ch, ch)
+                    # 1) Try translating masked text with FallbackTranslator to preserve tags
+                    fb_trans = await FallbackTranslator.translate_async(
+                        masked_text,
+                        source_lang=language.upper(),
+                        target_lang="KO"
+                    )
 
-                        converted = re.sub(
-                            r'[\u4e00-\u9fff]',
-                            lambda m: _hanja_to_reading(m.group(0)),
-                            safeguard_text
-                        )
-                        remaining = re.findall(r'[\u4e00-\u9fff]', converted)
-                        if len(remaining) < len(hanja_in_safe):
-                            logger.warning(
-                                f"Chunk #{idx+1}: [세이프가드-1] 한자 독음 변환 "
-                                f"{len(hanja_in_safe) - len(remaining)}자 처리. "
-                                f"잔여 {len(remaining)}자."
-                            )
-                            safeguard_text = converted
-                            self.signals.log_emitted.emit(
-                                "WARNING",
-                                f"Chunk #{idx+1}: [세이프가드-1] 잔존 한자 "
-                                f"{len(hanja_in_safe) - len(remaining)}자 독음 변환 적용"
-                            )
-
-                    # ── 세이프가드 2단계: FallbackTranslator(구글 번역 등) 최종 시도 ──────────
-                    fallback_success = False
-                    try:
+                    # 2) If masked translation failed or tags corrupt, try unmasked clean source text
+                    if not fb_trans or not fb_trans.strip():
                         pure_src = TagMasker.unmask_tags(masked_text, tag_map)
                         clean_src_for_fb = QualityChecker.extract_clean_text(pure_src)
                         if clean_src_for_fb.strip():
-                            fb_result = await FallbackTranslator.translate_async(
+                            fb_trans = await FallbackTranslator.translate_async(
                                 clean_src_for_fb,
                                 source_lang=language.upper(),
                                 target_lang="KO"
                             )
-                            if fb_result and fb_result.strip() and fb_result.strip() != clean_src_for_fb.strip():
-                                # FallbackTranslator 성공 시 이를 우선 사용
-                                safeguard_text = fb_result
-                                fallback_success = True
-                                logger.warning(
-                                    f"Chunk #{idx+1}: [세이프가드-2] FallbackTranslator 번역 성공 "
-                                    f"({len(fb_result)}자). 폴백 결과 사용."
-                                )
-                                self.signals.log_emitted.emit(
-                                    "WARNING",
-                                    f"Chunk #{idx+1}: [세이프가드-2] FallbackTranslator 폴백 성공 → 다음 청크 계속 진행"
-                                )
-                    except Exception as fb_err:
-                        logger.warning(f"Chunk #{idx+1}: [세이프가드-2] FallbackTranslator 실패: {fb_err}")
 
-                    # ── 세이프가드 3단계: 최선 후보 + 경고 태그 삽입 후 저장, 다음 청크 진행 ──
-                    if not fallback_success:
-                        # 최선 후보(독음 변환 적용된 safeguard_text)에 경고 태그 삽입
-                        remaining_hanja = re.findall(r'[\u4e00-\u9fff]', safeguard_text)
-                        if remaining_hanja:
-                            safe_note = f"\n<!-- [번역경고] 한자 {len(remaining_hanja)}자 미변환 잔존({last_issue[:60]}) -->\n"
+                    # 3) Validate Fallback result
+                    if fb_trans and fb_trans.strip():
+                        fb_unmasked = TagMasker.unmask_tags(fb_trans, tag_map)
+                        if not is_epub:
+                            fb_unmasked = TextCleaner.strip_html_tags(fb_unmasked)
+
+                        is_fb_valid, fb_invalid_reason = SessionManager.is_chunk_valid(fb_unmasked)
+                        if is_fb_valid:
+                            logger.info(
+                                f"Chunk #{idx+1}: [2차 폴백 성공] 구글 번역 대체 완료 ({len(fb_unmasked)}자)."
+                            )
+                            self.signals.log_emitted.emit(
+                                "INFO",
+                                f"Chunk #{idx+1}: [2차 폴백 성공] Gemini 실패 구간을 구글 번역으로 대체 완료."
+                            )
+                            final_translated = fb_unmasked
+                            translated_dict[idx] = final_translated
+                            self.signals.preview_updated.emit(text_chunk, final_translated)
+                            SessionManager.save_checkpoint(
+                                input_path, output_path, language, 0, translated_dict, glossary_entries,
+                                toc=toc_entries, book_title=book_title
+                            )
+                            return final_translated
                         else:
-                            safe_note = f"\n<!-- [번역경고] QC {max_gemini_qc_retries}회 실패({last_issue[:60]}) -->\n"
-                        safeguard_text = safe_note + safeguard_text
-                        logger.warning(
-                            f"Chunk #{idx+1}: [세이프가드-3] 경고 태그 삽입 후 저장 → 다음 청크 계속 진행."
-                        )
-                        self.signals.log_emitted.emit(
-                            "WARNING",
-                            f"Chunk #{idx+1}: [세이프가드-3] 경고 태그 삽입 후 저장 → Chunk #{idx+2}부터 번역 재개"
-                        )
+                            logger.warning(
+                                f"Chunk #{idx+1}: 2차 폴백 번역 결과 무결성 검증 탈락 ({fb_invalid_reason})."
+                            )
 
-                    # 태그 언마스크 & 최종 후처리
-                    if fallback_success:
-                        # 폴백 결과는 순수 텍스트이므로 원본 태그 구조로 감싸지 않음
-                        final_safeguard = safeguard_text
-                    else:
-                        final_safeguard = TagMasker.unmask_tags(safeguard_text, tag_map)
-                    if not is_epub:
-                        final_safeguard = TextCleaner.strip_html_tags(final_safeguard)
-                    if not final_safeguard.strip():
-                        final_safeguard = text_chunk  # 최후 보루: 원문 보존
-
-                    translated_dict[idx] = final_safeguard
-                    self.signals.preview_updated.emit(text_chunk, final_safeguard)
-                    SessionManager.save_checkpoint(
-                        input_path, output_path, language, 0, translated_dict, glossary_entries,
-                        toc=toc_entries, book_title=book_title
+                    # 4.5. All translation channels failed (Gemini + Fallback)
+                    # 절대 중국어 원문이나 경고 태그를 저장하지 않고 작업을 안전 일시 정지!
+                    logger.error(
+                        f"Chunk #{idx+1}: Gemini 및 2차 폴백 번역 모두 실패! "
+                        f"원문 오염 저장 방지를 위해 작업을 안전 일시 정지합니다."
                     )
-                    logger.info(f"Chunk #{idx+1}: 세이프가드 저장 완료. Chunk #{idx+2}부터 계속 진행.")
-                    return final_safeguard
+                    self.signals.log_emitted.emit(
+                        "ERROR",
+                        f"🚨 [번역 일시 정지] Chunk #{idx+1}: Gemini 및 2차 폴백(구글 번역) 모두 응답 불가. "
+                        f"중국어 원문 오염 저장을 차단하고 작업을 안전 일시 정지합니다."
+                    )
+                    self.signals.status_changed.emit(f"Chunk #{idx+1} 번역 실패 (일시 정지됨 - API 키 및 네트워크 확인 필요)")
+                    self.pause()
+                    return None
 
-                # 4.5. Glossary Post-Correction & Korean Josa Repair
+                # 4.6. Glossary Post-Correction & Korean Josa Repair
                 if glossary_entries and use_glossary:
                     translated_masked = GlossaryCorrector.correct_text(
                         source_text=masked_text,
@@ -673,31 +670,45 @@ class TranslationOrchestrator(QtCore.QObject):
 
                 # Final Safeguard: Ensure non-empty output
                 if not final_translated.strip():
-                    logger.warning(f"Chunk #{idx+1}: 최종 출력 공백 -> 원문 태그 안전 보존")
-                    final_translated = text_chunk
+                    logger.warning(f"Chunk #{idx+1}: 최종 출력 공백 -> 폴백 번역 시도")
+                    fb_rescue = await FallbackTranslator.translate_async(masked_text, source_lang=language.upper(), target_lang="KO")
+                    if fb_rescue and fb_rescue.strip():
+                        final_translated = TagMasker.unmask_tags(fb_rescue, tag_map)
+                    else:
+                        final_translated = text_chunk
 
                 # 6. Final Integrity Validation before saving to Checkpoint
                 is_valid, invalid_reason = SessionManager.is_chunk_valid(final_translated)
                 if not is_valid:
+                    logger.warning(
+                        f"Chunk #{idx+1}: Gemini 산출물 최종 무결성 검증 탈락 ({invalid_reason}). "
+                        f"2차 폴백 번역(구글 번역)으로 긴급 구제 시도..."
+                    )
+                    fb_rescue = await FallbackTranslator.translate_async(
+                        masked_text,
+                        source_lang=language.upper(),
+                        target_lang="KO"
+                    )
+                    if fb_rescue and fb_rescue.strip():
+                        fb_unmasked = TagMasker.unmask_tags(fb_rescue, tag_map)
+                        if not is_epub:
+                            fb_unmasked = TextCleaner.strip_html_tags(fb_unmasked)
+                        is_fb_valid, _ = SessionManager.is_chunk_valid(fb_unmasked)
+                        if is_fb_valid:
+                            logger.info(f"Chunk #{idx+1}: 2차 폴백 번역으로 성공적 긴급 구제 완료.")
+                            final_translated = fb_unmasked
+                            is_valid = True
+
+                if not is_valid:
                     abort_reason = f"Chunk #{idx+1} 최종 산출물 무결성 검증 실패: {invalid_reason}"
-                    logger.error(f"[FAIL-FAST ABORT] {abort_reason}. 체크포인트 오염 방지를 위해 번역 파이프라인을 즉시 안전 중단합니다.")
-                    
-                    self.cancel_requested = True
-                    self.is_running = False
-                    
+                    logger.error(f"[FAIL-FAST] {abort_reason}. 불량 데이터 체크포인트 저장 방지를 위해 작업을 일시 정지합니다.")
                     self.signals.log_emitted.emit(
                         "ERROR",
-                        f"🚨 [긴급 강제 중단] Chunk #{idx+1}: {invalid_reason}\n"
-                        f"데이터 무결성 보호를 위해 작업을 즉시 중단했습니다."
+                        f"🚨 [번역 일시 정지] Chunk #{idx+1}: {invalid_reason}\n"
+                        f"체크포인트 오염 보호를 위해 작업을 일시 정지했습니다."
                     )
-                    self.signals.status_changed.emit("품질 기준 미달로 안전을 위해 번역 프로세스를 강제 중단합니다")
-                    self.signals.completed.emit(
-                        False,
-                        f"[번역 긴급 중단]\n\n"
-                        f"청크 #{idx+1}의 최종 번역문에서 데이터 무결성 결함이 감지되었습니다.\n"
-                        f"사유: {invalid_reason}\n\n"
-                        f"불량 데이터의 체크포인트 저장을 차단하기 위해 프로세스를 안전하게 강제 중단했습니다."
-                    )
+                    self.signals.status_changed.emit(f"Chunk #{idx+1} 품질 기준 미달로 일시 정지됨")
+                    self.pause()
                     return None
 
                 # Save pure translation output only (Passed all quality checks)

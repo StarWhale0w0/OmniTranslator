@@ -386,3 +386,34 @@ class MainWindow(QtWidgets.QMainWindow):
                 "용어집 추출 실패",
                 f"용어집 추출 중 오류가 발생했습니다:\n{file_path_str}"
             )
+
+    def closeEvent(self, event: QtGui.QCloseEvent):
+        """Ensures all in-memory translation state and progress are safely flushed to disk before closing."""
+        if self.orchestrator.is_running:
+            res = QtWidgets.QMessageBox.question(
+                self,
+                "프로그램 종료 확인",
+                "현재 번역 작업이 진행 중입니다.\n지금까지 번역된 모든 진행 상황(체크포인트)을 디스크에 안전하게 저장하고 종료하시겠습니까?",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.Yes
+            )
+            if res == QtWidgets.QMessageBox.No:
+                event.ignore()
+                return
+
+            self.status_label.setText("진행 데이터 디스크 동기화 및 안전 종료 중...")
+            logger.info("Window close requested during active translation. Flushing checkpoint to disk...")
+            self.orchestrator.cancel()
+            self.orchestrator.flush_checkpoint()
+            self.orchestrator.cleanup()
+        else:
+            # Save any glossary edits in UI table if input path exists
+            in_path = self.input_edit.text().strip()
+            if in_path and Path(in_path).exists():
+                entries = self.glossary_table.get_entries()
+                if entries:
+                    p = Path(in_path)
+                    g_file = p.parent / f"{p.name}.glossary.json"
+                    GlossaryExtractor.save_glossary_json(entries, g_file)
+
+        event.accept()

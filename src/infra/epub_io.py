@@ -97,12 +97,16 @@ class EpubIO:
                         logger.warning(f"ZIP fallback read failed for '{zip_name}': {e}")
                         continue
 
-                    # EpubHtml 객체 수동 생성
+                    # EpubHtml 객체 수동 생성 (유효한 uid 강제 보장)
+                    clean_name = re.sub(r'[^a-zA-Z0-9_]', '_', zip_name).strip('_')
+                    fallback_uid = f"fallback_{clean_name}" if clean_name else f"fallback_item_{len(chapter_items)+1}"
                     item = EpubHtml(
-                        uid=f"fallback_{re.sub(r'[^a-zA-Z0-9_]', '_', zip_name)}",
+                        uid=fallback_uid,
                         file_name=zip_name,
                         media_type="application/xhtml+xml",
                     )
+                    item.id = fallback_uid
+                    item.uid = fallback_uid
                     # [핵심 버그 수정]
                     # EpubHtml.get_content()는 내부에서 self.book.get_template()을 호출함.
                     # 수동 생성된 EpubHtml은 self.book이 None으로 초기화되므로
@@ -217,6 +221,135 @@ class EpubIO:
         return str(new_soup)
 
     @classmethod
+    def sanitize_book_uids(cls, book: Any) -> None:
+        """
+        [긴급 방어 로직]
+        EPUB 저장 전 book.get_items(), book.spine, book.toc 계층 전체를 순회하여
+        모든 아이템 및 목차 노드가 None이 아닌 유효한 문자열 uid/id를 갖도록 강제 보정합니다.
+        ebooklib의 NCX navPoint 생성 시 발생하는 lxml TypeError(NoneType)를 방지합니다.
+        """
+        if not book:
+            return
+
+        uid_counter = 0
+
+        def _generate_uid(prefix: str, seed: Optional[str] = None) -> str:
+            nonlocal uid_counter
+            uid_counter += 1
+            if seed:
+                clean_seed = re.sub(r'[^a-zA-Z0-9_]', '_', str(seed)).strip('_')
+                if clean_seed:
+                    return f"{prefix}_{clean_seed}_{uid_counter}"
+            return f"{prefix}_{uid_counter}"
+
+        # 1. book.get_items() 전체 점검 및 보정
+        if hasattr(book, 'get_items'):
+            for idx, item in enumerate(book.get_items(), start=1):
+                raw_uid = getattr(item, 'uid', None) or getattr(item, 'id', None)
+                if not raw_uid or not str(raw_uid).strip():
+                    file_name = getattr(item, 'file_name', '')
+                    new_uid = _generate_uid("chapter_uid", file_name)
+                    try:
+                        item.uid = new_uid
+                    except Exception:
+                        pass
+                    try:
+                        item.id = new_uid
+                    except Exception:
+                        pass
+                else:
+                    str_uid = str(raw_uid).strip()
+                    try:
+                        item.uid = str_uid
+                    except Exception:
+                        pass
+                    try:
+                        item.id = str_uid
+                    except Exception:
+                        pass
+
+        # 2. book.spine 점검 및 보정
+        if hasattr(book, 'spine') and book.spine:
+            sanitized_spine = []
+            for sp in book.spine:
+                if isinstance(sp, tuple):
+                    sp_item, sp_linear = sp[0], sp[1] if len(sp) > 1 else 'yes'
+                    if not isinstance(sp_item, str):
+                        raw_uid = getattr(sp_item, 'uid', None) or getattr(sp_item, 'id', None)
+                        if not raw_uid or not str(raw_uid).strip():
+                            new_uid = _generate_uid("spine_uid", getattr(sp_item, 'file_name', ''))
+                            try:
+                                sp_item.uid = new_uid
+                            except Exception:
+                                pass
+                            try:
+                                sp_item.id = new_uid
+                            except Exception:
+                                pass
+                    sanitized_spine.append(sp)
+                elif not isinstance(sp, str):
+                    raw_uid = getattr(sp, 'uid', None) or getattr(sp, 'id', None)
+                    if not raw_uid or not str(raw_uid).strip():
+                        new_uid = _generate_uid("spine_uid", getattr(sp, 'file_name', ''))
+                        try:
+                            sp.uid = new_uid
+                        except Exception:
+                            pass
+                        try:
+                            sp.id = new_uid
+                        except Exception:
+                            pass
+                    sanitized_spine.append(sp)
+                else:
+                    sanitized_spine.append(sp)
+            book.spine = sanitized_spine
+
+        # 3. book.toc 계층 구조 재귀 점검 및 보정 (튜플, 리스트, Section, Link, EpubItem 등)
+        def _sanitize_toc_node(node: Any) -> Any:
+            nonlocal uid_counter
+            if node is None:
+                return None
+
+            if isinstance(node, (list, tuple)):
+                sanitized = [_sanitize_toc_node(child) for child in node]
+                return tuple(sanitized) if isinstance(node, tuple) else sanitized
+
+            raw_uid = getattr(node, 'uid', None) or getattr(node, 'id', None)
+            if not raw_uid or not str(raw_uid).strip():
+                seed = (
+                    getattr(node, 'href', '') or
+                    getattr(node, 'file_name', '') or
+                    getattr(node, 'title', '')
+                )
+                new_uid = _generate_uid("toc_uid", seed)
+                try:
+                    node.uid = new_uid
+                except Exception:
+                    pass
+                try:
+                    node.id = new_uid
+                except Exception:
+                    pass
+            else:
+                str_uid = str(raw_uid).strip()
+                try:
+                    node.uid = str_uid
+                except Exception:
+                    pass
+                try:
+                    node.id = str_uid
+                except Exception:
+                    pass
+
+            return node
+
+        if hasattr(book, 'toc') and book.toc:
+            if isinstance(book.toc, list):
+                book.toc = [_sanitize_toc_node(elem) for elem in book.toc]
+            elif isinstance(book.toc, tuple):
+                book.toc = tuple(_sanitize_toc_node(elem) for elem in book.toc)
+
+    @classmethod
     def save_epub(
         cls,
         book: Any,
@@ -244,6 +377,9 @@ class EpubIO:
                 input_file_path=input_file_path,
                 language=language
             )
+
+        # [긴급 방어 로직] write_epub 직전 모든 items, spine, TOC 항목의 uid 유효성 보정
+        cls.sanitize_book_uids(book)
 
         epub.write_epub(str(output_epub_path), book)
         logger.info(f"EPUB with synchronized Korean TOC saved successfully to {output_epub_path}")

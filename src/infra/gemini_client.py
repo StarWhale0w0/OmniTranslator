@@ -222,11 +222,16 @@ class GeminiClient:
         and prompt relaxation on blocks.
         """
         num_keys = max(1, self.key_manager.get_key_count())
-        max_retries = max(num_keys * 3, 5)
+        max_retries = min(max(num_keys * 2, 3), 8)
         current_system_instruction = system_instruction
         last_error_reason = "Unknown error"
 
         for attempt in range(max_retries):
+            # If all keys are known to be in cooldown and at least 2 attempts have been made, exit early to allow fallback
+            if attempt >= 2 and self.key_manager.all_keys_exhausted():
+                logger.warning(f"All {num_keys} API keys are currently in cooldown (429/Quota). Exiting Gemini loop early to trigger safe fallback.")
+                break
+
             api_key = self.key_manager.get_active_key()
             await self.key_manager.acquire_rpm_slot()
 
@@ -315,10 +320,7 @@ class GeminiClient:
                     await asyncio.sleep(backoff)
 
         # If all retries across all keys exhausted
-        logger.warning(
+        logger.error(
             f"All {max_retries} Gemini retries across all API keys exhausted. Last error: {last_error_reason}"
         )
-        if raw_fallback_text is not None:
-            return raw_fallback_text
-
         raise RuntimeError(f"Failed to generate content after exhausting all Gemini keys: {last_error_reason}")

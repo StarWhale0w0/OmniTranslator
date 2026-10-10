@@ -54,22 +54,44 @@ class SessionManager:
         if cls.UNMASKED_TAG_REGEX.search(chunk_text):
             return False, "미복원된 [TAG_N] 플레이스홀더 잔존"
 
+        # Reject any chunks with warning tags or uncompleted safeguard markers
+        if "<!-- [번역경고]" in chunk_text or "[번역경고]" in chunk_text or "[품질경고:" in chunk_text:
+            return False, "번역 실패/미변환 경고 태그 잔존 (<!-- [번역경고] -->)"
+
         # Check for untranslated Hanja (CJK) ideographs
         clean_body = re.sub(r'<[^>]+>', '', chunk_text)
         clean_body = re.sub(r'\[\s*TAG\s*_?\s*\d+\s*\]', '', clean_body, flags=re.IGNORECASE)
-        hanja_matches = cls.HANJA_REGEX.findall(clean_body)
+        # Exclude legitimate bracketed Hanja annotations (e.g. 양강패절(陽剛霸絕))
+        clean_body_no_brackets = re.sub(
+            r'[\uac00-\ud7af]+\s*[\(\（][\u4e00-\u9fff\s]+[\)\）]',
+            lambda m: re.sub(r'[\u4e00-\u9fff]', '', m.group(0)),
+            clean_body
+        )
+        hanja_matches = cls.HANJA_REGEX.findall(clean_body_no_brackets)
         hangul_matches = re.findall(r'[\uac00-\ud7af]', clean_body)
         hanja_count = len(hanja_matches)
         hangul_count = len(hangul_matches)
 
         if hanja_count > 0:
-            hanja_ratio = (hanja_count / len(clean_body)) if len(clean_body) > 0 else 0.0
-            # Allow legitimate Hanja (e.g. name wordplay, incantations, annotations) if Korean text is predominant
-            if hangul_count >= 20 and hanja_ratio < 0.12 and hangul_count > hanja_count * 2:
-                pass
-            elif hanja_count >= 5 or (len(clean_body) >= 30 and hanja_ratio >= 0.03):
+            total_clean_len = len(clean_body.strip())
+            hanja_ratio = (hanja_count / total_clean_len) if total_clean_len > 0 else 0.0
+
+            # 1. No Hangul with multiple Hanja characters (completely untranslated raw source)
+            if hangul_count < 10 and hanja_count >= 5:
                 sample_hanja = "".join(hanja_matches[:10])
-                return False, f"미번역 한자(CJK) {hanja_count}자 잔존 ('{sample_hanja}...')"
+                return False, f"한글 부재 및 미번역 원문 한자 {hanja_count}자 잔존 ('{sample_hanja}...')"
+
+            # 2. More Hanja than Hangul (abnormal untranslated state)
+            if hanja_count > hangul_count:
+                sample_hanja = "".join(hanja_matches[:10])
+                return False, f"미번역 한자({hanja_count}자)가 한글({hangul_count}자) 초과 ('{sample_hanja}...')"
+
+            # 3. High Hanja ratio
+            if hangul_count >= 30 and hanja_ratio < 0.05 and hangul_count >= hanja_count * 3:
+                pass
+            elif hanja_count >= 10 or (total_clean_len >= 30 and hanja_ratio >= 0.06):
+                sample_hanja = "".join(hanja_matches[:10])
+                return False, f"비정상적 미번역 한자 잔존: {hanja_count}자 ({hanja_ratio*100:.1f}%) ('{sample_hanja}...')"
 
         return True, None
 
@@ -96,7 +118,7 @@ class SessionManager:
                 purged_count += 1
                 logger.warning(
                     f"Checkpoint Chunk #{idx+1} is contaminated/corrupted ({reason}). "
-                    f"Purging from checkpoint for Gemini re-translation."
+                    f"Purging from checkpoint for re-translation."
                 )
 
         return sanitized, purged_count
@@ -105,6 +127,52 @@ class SessionManager:
     def get_meta_filepath(cls, input_file_path: Path) -> Path:
         """Returns the .meta.json path for a given input file."""
         return input_file_path.parent / f"{input_file_path.name}.meta.json"
+
+    @classmethod
+    def _atomic_json_write(cls, target_path: Path, data: Dict[str, Any]) -> bool:
+        """
+        Safely and atomically writes JSON data to disk on all platforms (including Windows).
+        Uses explicit f.flush() + os.fsync() and exponential backoff retry for Windows file locks.
+        """
+        import os
+        import time
+        import uuid
+        
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = target_path.parent / f"{target_path.name}.tmp_{os.getpid()}_{uuid.uuid4().hex[:8]}"
+        
+        try:
+            with open(temp_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            
+            # Atomic replace with retry for Windows WinError 32 / 5
+            max_retries = 5
+            for attempt in range(max_retries):
+                try:
+                    os.replace(temp_path, target_path)
+                    return True
+                except (PermissionError, OSError) as pe:
+                    if attempt < max_retries - 1:
+                        time.sleep(0.05 * (2 ** attempt))
+                    else:
+                        # Final fallback: copy & remove temp
+                        import shutil
+                        shutil.copyfile(temp_path, target_path)
+                        try:
+                            temp_path.unlink()
+                        except Exception:
+                            pass
+                        return True
+        except Exception as e:
+            logger.error(f"Failed atomic JSON write to {target_path}: {e}")
+            if temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except Exception:
+                    pass
+            return False
 
     @classmethod
     def save_checkpoint(
@@ -118,7 +186,7 @@ class SessionManager:
         toc: Optional[List[Dict[str, Any]]] = None,
         book_title: Optional[str] = None
     ) -> Path:
-        """Atomic write of checkpoint data including TOC and title metadata into .meta.json."""
+        """Atomic and synchronized write of checkpoint data including TOC and title metadata into .meta.json."""
         meta_path = cls.get_meta_filepath(input_file_path)
         data = {
             "input_file": str(input_file_path),
@@ -132,14 +200,9 @@ class SessionManager:
             "glossary": glossary
         }
         
-        temp_meta_path = meta_path.with_suffix(".tmp")
-        try:
-            with open(temp_meta_path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            temp_meta_path.replace(meta_path)  # Atomic replace
-            logger.debug(f"Atomic Checkpoint saved: {meta_path} ({len(translated_chunks)} chunks, {len(data['toc'])} TOC items)")
-        except Exception as e:
-            logger.error(f"Failed to save atomic checkpoint ({meta_path}): {e}")
+        success = cls._atomic_json_write(meta_path, data)
+        if success:
+            logger.debug(f"Atomic Checkpoint saved & synced: {meta_path} ({len(translated_chunks)} chunks, {len(data['toc'])} TOC items)")
         return meta_path
 
     @classmethod
@@ -161,6 +224,13 @@ class SessionManager:
                             f"Sanitized checkpoint: {purged_count} contaminated/corrupted chunks purged for re-translation. "
                             f"{len(clean_chunks)} valid chunks retained."
                         )
+                        # Immediately persist sanitized state back to disk so purged chunks stay purged
+                        cls._atomic_json_write(meta_path, {
+                            **data,
+                            "translated_chunks": {str(k): v for k, v in clean_chunks.items()},
+                            "processed_count": len(clean_chunks)
+                        })
+                        logger.info(f"Persisted sanitized checkpoint to {meta_path} (purged {purged_count} chunks).")
                 logger.info(
                     f"Loaded existing checkpoint from {meta_path} "
                     f"({data.get('processed_count', 0)} chunks, {len(data.get('toc', []))} TOC items)"
@@ -188,12 +258,10 @@ class SessionManager:
             if book_title:
                 data["book_title"] = book_title
             
-            temp_meta = meta_path.with_suffix(".tmp")
-            with open(temp_meta, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            temp_meta.replace(meta_path)
-            logger.info(f"Updated TOC entries ({len(toc_entries)} items) in checkpoint: {meta_path}")
-            return True
+            success = cls._atomic_json_write(meta_path, data)
+            if success:
+                logger.info(f"Updated TOC entries ({len(toc_entries)} items) in checkpoint: {meta_path}")
+            return success
         except Exception as e:
             logger.error(f"Failed to update TOC in checkpoint ({meta_path}): {e}")
             return False

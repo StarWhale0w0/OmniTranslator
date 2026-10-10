@@ -139,11 +139,22 @@ class TOCProcessor:
         """
         entries: List[Dict[str, Any]] = []
 
+        meta_idx = 0
+
         def _traverse(entry: Any, level: int = 0) -> Optional[Dict[str, Any]]:
+            nonlocal meta_idx
+            meta_idx += 1
             if isinstance(entry, Link):
+                raw_id = getattr(entry, 'uid', None) or getattr(entry, 'id', None)
+                if not raw_id:
+                    seed = re.sub(r'[^a-zA-Z0-9_]', '_', entry.href or entry.title or '').strip('_')
+                    uid_val = f"link_{seed}_{meta_idx}" if seed else f"link_{meta_idx}"
+                else:
+                    uid_val = str(raw_id).strip()
+
                 return {
                     "type": "link",
-                    "id": getattr(entry, 'uid', getattr(entry, 'id', '')),
+                    "id": uid_val,
                     "original_title": entry.title,
                     "translated_title": None,
                     "href": entry.href,
@@ -153,7 +164,13 @@ class TOCProcessor:
                 parent, subitems = entry
                 parent_title = parent.title if hasattr(parent, 'title') else str(parent)
                 parent_href = getattr(parent, 'href', '')
-                parent_id = getattr(parent, 'uid', getattr(parent, 'id', ''))
+                raw_parent_id = getattr(parent, 'uid', None) or getattr(parent, 'id', None)
+                if not raw_parent_id:
+                    seed = re.sub(r'[^a-zA-Z0-9_]', '_', parent_href or parent_title or '').strip('_')
+                    parent_id = f"sec_{seed}_{meta_idx}" if seed else f"sec_{meta_idx}"
+                else:
+                    parent_id = str(raw_parent_id).strip()
+
                 mapped_subs = []
                 for sub in subitems:
                     res = _traverse(sub, level + 1)
@@ -169,9 +186,16 @@ class TOCProcessor:
                     "subitems": mapped_subs
                 }
             elif isinstance(entry, Section):
+                raw_id = getattr(entry, 'uid', None) or getattr(entry, 'id', None)
+                if not raw_id:
+                    seed = re.sub(r'[^a-zA-Z0-9_]', '_', getattr(entry, 'href', '') or entry.title or '').strip('_')
+                    uid_val = f"sec_{seed}_{meta_idx}" if seed else f"sec_{meta_idx}"
+                else:
+                    uid_val = str(raw_id).strip()
+
                 return {
                     "type": "section",
-                    "id": getattr(entry, 'uid', getattr(entry, 'id', '')),
+                    "id": uid_val,
                     "original_title": entry.title,
                     "translated_title": None,
                     "href": getattr(entry, 'href', ''),
@@ -179,9 +203,16 @@ class TOCProcessor:
                     "subitems": []
                 }
             elif isinstance(entry, EpubHtml):
+                raw_id = getattr(entry, 'uid', None) or getattr(entry, 'id', None) or entry.get_id()
+                if not raw_id:
+                    seed = re.sub(r'[^a-zA-Z0-9_]', '_', entry.file_name or entry.title or '').strip('_')
+                    uid_val = f"ch_{seed}_{meta_idx}" if seed else f"ch_{meta_idx}"
+                else:
+                    uid_val = str(raw_id).strip()
+
                 return {
                     "type": "chapter",
-                    "id": entry.get_id(),
+                    "id": uid_val,
                     "original_title": entry.title,
                     "translated_title": None,
                     "href": entry.file_name,
@@ -250,8 +281,12 @@ class TOCProcessor:
                     return extracted
             return None
 
+        entry_idx = 0
+
         # Recursive updater for book.toc
         def _update_entry(entry: Any, level: int = 0) -> Tuple[Any, Dict[str, Any]]:
+            nonlocal entry_idx
+            entry_idx += 1
             if isinstance(entry, Link):
                 orig_title = entry.title
                 extracted = _resolve_href_title(entry.href)
@@ -263,9 +298,25 @@ class TOCProcessor:
                 if final_title != orig_title:
                     logger.debug(f"TOC Link Updated: '{orig_title}' -> '{final_title}' ({entry.href})")
 
+                raw_uid = getattr(entry, 'uid', None) or getattr(entry, 'id', None)
+                if not raw_uid or not str(raw_uid).strip():
+                    seed = re.sub(r'[^a-zA-Z0-9_]', '_', entry.href or final_title or '').strip('_')
+                    uid_val = f"link_{seed}_{entry_idx}" if seed else f"link_{entry_idx}"
+                else:
+                    uid_val = str(raw_uid).strip()
+
+                try:
+                    entry.uid = uid_val
+                except Exception:
+                    pass
+                try:
+                    entry.id = uid_val
+                except Exception:
+                    pass
+
                 entry_meta = {
                     "type": "link",
-                    "id": getattr(entry, 'uid', getattr(entry, 'id', '')),
+                    "id": uid_val,
                     "original_title": orig_title,
                     "translated_title": final_title,
                     "href": entry.href,
@@ -277,7 +328,24 @@ class TOCProcessor:
                 parent, subitems = entry
                 parent_title = parent.title if hasattr(parent, 'title') else str(parent)
                 parent_href = getattr(parent, 'href', '')
-                parent_id = getattr(parent, 'uid', getattr(parent, 'id', ''))
+                
+                raw_parent_id = getattr(parent, 'uid', None) or getattr(parent, 'id', None)
+                if not raw_parent_id or not str(raw_parent_id).strip():
+                    seed = re.sub(r'[^a-zA-Z0-9_]', '_', parent_href or parent_title or '').strip('_')
+                    parent_id = f"sec_{seed}_{entry_idx}" if seed else f"sec_{entry_idx}"
+                else:
+                    parent_id = str(raw_parent_id).strip()
+
+                if hasattr(parent, 'uid'):
+                    try:
+                        parent.uid = parent_id
+                    except Exception:
+                        pass
+                if hasattr(parent, 'id'):
+                    try:
+                        parent.id = parent_id
+                    except Exception:
+                        pass
                 
                 extracted_parent = None
                 if parent_href:
@@ -319,9 +387,26 @@ class TOCProcessor:
 
                 final_title = extracted or orig_title
                 entry.title = final_title
+
+                raw_uid = getattr(entry, 'uid', None) or getattr(entry, 'id', None)
+                if not raw_uid or not str(raw_uid).strip():
+                    seed = re.sub(r'[^a-zA-Z0-9_]', '_', getattr(entry, 'href', '') or final_title or '').strip('_')
+                    uid_val = f"sec_{seed}_{entry_idx}" if seed else f"sec_{entry_idx}"
+                else:
+                    uid_val = str(raw_uid).strip()
+
+                try:
+                    entry.uid = uid_val
+                except Exception:
+                    pass
+                try:
+                    entry.id = uid_val
+                except Exception:
+                    pass
+
                 entry_meta = {
                     "type": "section",
-                    "id": getattr(entry, 'uid', getattr(entry, 'id', '')),
+                    "id": uid_val,
                     "original_title": orig_title,
                     "translated_title": final_title,
                     "href": getattr(entry, 'href', ''),
@@ -335,9 +420,26 @@ class TOCProcessor:
                 extracted = _resolve_href_title(entry.file_name)
                 final_title = extracted or orig_title
                 entry.title = final_title
+
+                raw_uid = getattr(entry, 'uid', None) or getattr(entry, 'id', None)
+                if not raw_uid or not str(raw_uid).strip():
+                    seed = re.sub(r'[^a-zA-Z0-9_]', '_', entry.file_name or final_title or '').strip('_')
+                    uid_val = f"ch_{seed}_{entry_idx}" if seed else f"ch_{entry_idx}"
+                else:
+                    uid_val = str(raw_uid).strip()
+
+                try:
+                    entry.uid = uid_val
+                except Exception:
+                    pass
+                try:
+                    entry.id = uid_val
+                except Exception:
+                    pass
+
                 entry_meta = {
                     "type": "chapter",
-                    "id": entry.get_id(),
+                    "id": uid_val,
                     "original_title": orig_title,
                     "translated_title": final_title,
                     "href": entry.file_name,
@@ -431,18 +533,30 @@ class TOCProcessor:
             book.add_metadata('DC', 'language', lang_code)
 
         # 3. Ensure EpubNcx exists
-        has_ncx = any(isinstance(it, EpubNcx) for it in book.get_items())
-        if not has_ncx:
+        existing_ncx = [it for it in book.get_items() if isinstance(it, EpubNcx)]
+        if not existing_ncx:
             ncx = EpubNcx(uid="ncx", file_name="toc.ncx")
             book.add_item(ncx)
             logger.debug("Added EpubNcx item to book.")
+        else:
+            for ncx in existing_ncx:
+                if not getattr(ncx, 'uid', None):
+                    ncx.uid = "ncx"
+                if not getattr(ncx, 'id', None):
+                    ncx.id = "ncx"
 
         # 4. Ensure EpubNav exists
-        has_nav = any(isinstance(it, EpubNav) for it in book.get_items())
-        if not has_nav:
+        existing_nav = [it for it in book.get_items() if isinstance(it, EpubNav)]
+        if not existing_nav:
             nav = EpubNav(uid="nav", file_name="nav.xhtml")
             book.add_item(nav)
             logger.debug("Added EpubNav item to book.")
+        else:
+            for nav in existing_nav:
+                if not getattr(nav, 'uid', None):
+                    nav.uid = "nav"
+                if not getattr(nav, 'id', None):
+                    nav.id = "nav"
 
     @classmethod
     def extract_or_infer_book_title(

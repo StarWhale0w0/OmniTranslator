@@ -112,16 +112,42 @@ class GlossaryExtractor:
 
     @classmethod
     def save_checkpoint(cls, checkpoint_path: Path, data: Dict[str, Any]) -> None:
-        """Atomically saves intermediate glossary extraction progress."""
+        """Atomically and safely saves intermediate glossary extraction progress with fsync."""
+        import os
+        import time
+        import uuid
+        
         checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = checkpoint_path.with_suffix(".tmp_write")
+        temp_path = checkpoint_path.parent / f"{checkpoint_path.name}.tmp_{os.getpid()}_{uuid.uuid4().hex[:8]}"
         try:
             with open(temp_path, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
-            temp_path.replace(checkpoint_path)
+                f.flush()
+                os.fsync(f.fileno())
+            
+            max_retries = 5
+            for attempt in range(max_retries):
+                try:
+                    os.replace(temp_path, checkpoint_path)
+                    break
+                except (PermissionError, OSError):
+                    if attempt < max_retries - 1:
+                        time.sleep(0.05 * (2 ** attempt))
+                    else:
+                        import shutil
+                        shutil.copyfile(temp_path, checkpoint_path)
+                        try:
+                            temp_path.unlink()
+                        except Exception:
+                            pass
             logger.debug(f"Atomic glossary checkpoint saved: {checkpoint_path} ({len(data.get('completed_blocks', []))} blocks done)")
         except Exception as e:
             logger.error(f"Failed to save atomic glossary checkpoint ({checkpoint_path}): {e}")
+            if temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except Exception:
+                    pass
 
     @classmethod
     def load_checkpoint(cls, checkpoint_path: Path) -> Optional[Dict[str, Any]]:
@@ -650,11 +676,42 @@ class GlossaryExtractor:
 
     @classmethod
     def save_glossary_json(cls, entries: List[Dict[str, Any]], filepath: Path) -> None:
-        """Saves final verified glossary JSON file."""
+        """Saves final verified glossary JSON file atomically with fsync."""
+        import os
+        import time
+        import uuid
+        
         filepath.parent.mkdir(parents=True, exist_ok=True)
-        with open(filepath, 'w', encoding='utf-8') as f:
-            json.dump(entries, f, ensure_ascii=False, indent=2)
-        logger.info(f"Saved {len(entries)} glossary entries to {filepath}")
+        temp_path = filepath.parent / f"{filepath.name}.tmp_{os.getpid()}_{uuid.uuid4().hex[:8]}"
+        try:
+            with open(temp_path, 'w', encoding='utf-8') as f:
+                json.dump(entries, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            
+            max_retries = 5
+            for attempt in range(max_retries):
+                try:
+                    os.replace(temp_path, filepath)
+                    break
+                except (PermissionError, OSError):
+                    if attempt < max_retries - 1:
+                        time.sleep(0.05 * (2 ** attempt))
+                    else:
+                        import shutil
+                        shutil.copyfile(temp_path, filepath)
+                        try:
+                            temp_path.unlink()
+                        except Exception:
+                            pass
+            logger.info(f"Saved {len(entries)} glossary entries to {filepath}")
+        except Exception as e:
+            logger.error(f"Failed to save glossary JSON ({filepath}): {e}")
+            if temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except Exception:
+                    pass
 
     @classmethod
     def load_glossary_json(cls, filepath: Path) -> List[Dict[str, Any]]:
