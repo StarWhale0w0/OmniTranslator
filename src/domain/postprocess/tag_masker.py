@@ -59,6 +59,14 @@ class TagMasker:
         if not html_content:
             return "", {}, ""
 
+        # Pre-flatten any remaining ruby tags before masking to prevent word splitting
+        if '<ruby' in html_content.lower() or '<rt' in html_content.lower():
+            try:
+                from domain.epub.ruby_processor import RubyProcessor
+                html_content = RubyProcessor.flatten_ruby_html(html_content)
+            except Exception:
+                pass
+
         tag_map: Dict[str, str] = {}
         counter = 0
 
@@ -84,6 +92,15 @@ class TagMasker:
             return ""
         if '<' not in html_content:
             return html_content.strip()
+
+        # Pre-flatten ruby tags so pronunciation is removed/handled cleanly before extracting text
+        if '<ruby' in html_content.lower() or '<rt' in html_content.lower():
+            try:
+                from domain.epub.ruby_processor import RubyProcessor
+                html_content = RubyProcessor.flatten_ruby_html(html_content)
+            except Exception:
+                pass
+
         try:
             soup = BeautifulSoup(html_content, 'html.parser')
             for tag in soup.find_all(list(cls.IGNORED_TAGS)):

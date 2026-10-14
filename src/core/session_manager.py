@@ -203,14 +203,26 @@ class SessionManager:
         success = cls._atomic_json_write(meta_path, data)
         if success:
             logger.debug(f"Atomic Checkpoint saved & synced: {meta_path} ({len(translated_chunks)} chunks, {len(data['toc'])} TOC items)")
+            # Create a backup mirror (.meta.json.bak) to guarantee disaster recovery
+            try:
+                import shutil
+                bak_path = meta_path.with_name(f"{meta_path.name}.bak")
+                shutil.copyfile(meta_path, bak_path)
+            except Exception as _be:
+                logger.debug(f"Checkpoint backup mirror creation skipped: {_be}")
         return meta_path
 
     @classmethod
     def load_checkpoint(cls, input_file_path: Path) -> Optional[Dict[str, Any]]:
-        """Loads and sanitizes existing checkpoint from .meta.json."""
+        """Loads and sanitizes existing checkpoint from .meta.json, with automatic fallback to .bak."""
         meta_path = cls.get_meta_filepath(input_file_path)
         if not meta_path.exists():
-            return None
+            bak_path = meta_path.with_name(f"{meta_path.name}.bak")
+            if bak_path.exists():
+                logger.info(f"기본 체크포인트 파일 부재 -> 백업본({bak_path.name})으로부터 자동 복구 및 로드 시도.")
+                meta_path = bak_path
+            else:
+                return None
         try:
             with open(meta_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
@@ -299,8 +311,8 @@ class SessionManager:
 
         removed_files: List[Path] = []
         for target in candidate_paths:
-            # 절대 삭제 금지: *.glossary.json (영구 보존 자산)
-            if target.name.endswith(".glossary.json"):
+            # 절대 삭제 금지: *.glossary.json (영구 보존 자산) 및 *.bak (재해 복구용 최후 백업본)
+            if target.name.endswith(".glossary.json") or target.name.endswith(".bak"):
                 continue
 
             try:

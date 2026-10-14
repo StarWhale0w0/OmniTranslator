@@ -16,8 +16,13 @@ class TextCleaner:
         Strips residual HTML/XML tags, converts block tags to newlines,
         and unescapes HTML entities for pure text (TXT) output.
         """
-        if not text:
-            return ""
+        # 0. Flatten ruby tags (<ruby>, <rt>, <rp>) before stripping tags
+        if '<ruby' in text.lower() or '<rt' in text.lower():
+            try:
+                from domain.epub.ruby_processor import RubyProcessor
+                text = RubyProcessor.flatten_ruby_html(text)
+            except Exception:
+                pass
 
         # 1. Remove known virtual wrapper tags explicitly
         cleaned = re.sub(r'</?(?:main|body|html|head)[^>]*>', '', text, flags=re.IGNORECASE)

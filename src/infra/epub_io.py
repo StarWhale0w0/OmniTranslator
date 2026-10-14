@@ -20,6 +20,7 @@ import ebooklib
 from ebooklib import epub
 from ebooklib.epub import EpubHtml
 from domain.epub.toc_processor import TOCProcessor
+from domain.epub.ruby_processor import RubyProcessor
 from common.logger import setup_logger
 
 logger = setup_logger("EpubIO")
@@ -124,9 +125,21 @@ class EpubIO:
         except Exception as e:
             logger.warning(f"ZIP fallback scan failed: {e}")
 
+        # [루비 전처리] 모든 챕터 HTML의 <ruby>, <rt>, <rp> 태그를 한국어 독서 최적화 형태로 정제(Flatten)
+        # 단순 한자 독음(후리가나/병음)은 제거하여 텍스트 쪼개짐과 태그 마스킹 파편화 방지
+        for ch_item in chapter_items:
+            try:
+                raw_c = ch_item.get_content()
+                raw_s = raw_c.decode('utf-8', errors='ignore') if isinstance(raw_c, bytes) else str(raw_c)
+                if '<ruby' in raw_s.lower() or '<rt' in raw_s.lower():
+                    flattened_s = RubyProcessor.flatten_ruby_html(raw_s)
+                    ch_item.set_content(flattened_s.encode('utf-8'))
+            except Exception as e:
+                logger.warning(f"Chapter '{ch_item.get_name()}' ruby pre-flattening failed: {e}")
+
         logger.info(
             f"get_epub_chapters: 총 {len(chapter_items)}개 챕터 항목 "
-            f"(ebooklib + ZIP fallback 포함)"
+            f"(ebooklib + ZIP fallback 포함, 루비 태그 전처리 완료)"
         )
         return book, chapter_items
 
@@ -214,11 +227,14 @@ class EpubIO:
             html_tag.append(copy.copy(head))
         new_body = new_soup.new_tag("body")
         for translated_chunk in translated_chunks:
-            chunk_soup = BeautifulSoup(translated_chunk, "html.parser")
+            # 잔존 루비 태그 평탄화
+            clean_chunk = RubyProcessor.flatten_ruby_html(translated_chunk)
+            chunk_soup = BeautifulSoup(clean_chunk, "html.parser")
             for content in chunk_soup.contents:
                 new_body.append(content)
         html_tag.append(new_body)
-        return str(new_soup)
+        # 최종 조립된 HTML에 대해서도 잔존 루비 태그 최종 평탄화
+        return RubyProcessor.flatten_ruby_html(str(new_soup))
 
     @classmethod
     def sanitize_book_uids(cls, book: Any) -> None:
@@ -378,9 +394,35 @@ class EpubIO:
                 language=language
             )
 
+        # [루비 태그 최종 정제 및 CSS 리셋 스타일 주입]
+        # 1. EPUB 내 모든 챕터 HTML의 잔존 루비 태그 최종 정제
+        for item in book.get_items():
+            if isinstance(item, EpubHtml):
+                try:
+                    raw = item.get_content()
+                    raw_str = raw.decode('utf-8', errors='ignore') if isinstance(raw, bytes) else str(raw)
+                    if '<ruby' in raw_str.lower() or '<rt' in raw_str.lower():
+                        flattened = RubyProcessor.flatten_ruby_html(raw_str)
+                        item.set_content(flattened.encode('utf-8'))
+                except Exception:
+                    pass
+
+        # 2. EPUB 내 CSS 파일들에 루비 리셋 스타일 주입 (행간 붕 뜸 및 글자 깨짐 방지)
+        cls.inject_ruby_css(book)
+
         # [긴급 방어 로직] write_epub 직전 모든 items, spine, TOC 항목의 uid 유효성 보정
         cls.sanitize_book_uids(book)
 
         epub.write_epub(str(output_epub_path), book)
         logger.info(f"EPUB with synchronized Korean TOC saved successfully to {output_epub_path}")
         return final_toc_meta
+
+    @classmethod
+    def flatten_ruby_tags(cls, html_content: str) -> str:
+        """Flattens ruby tags in HTML content using RubyProcessor."""
+        return RubyProcessor.flatten_ruby_html(html_content)
+
+    @classmethod
+    def inject_ruby_css(cls, book: Any) -> bool:
+        """Injects ruby reset CSS to all stylesheets in the EPUB book."""
+        return RubyProcessor.inject_ruby_css_to_book(book)

@@ -391,7 +391,7 @@ class TranslationOrchestrator(QtCore.QObject):
                 self.signals.preview_updated.emit(text_chunk, f"[{_reason} - 바이패스됨]")
                 translated_dict[idx] = text_chunk
                 SessionManager.save_checkpoint(
-                    input_path, output_path, language, 0, translated_dict, glossary_entries,
+                    input_path, output_path, language, self.current_total_chunks, translated_dict, glossary_entries,
                     toc=toc_entries, book_title=book_title
                 )
                 return text_chunk
@@ -629,7 +629,7 @@ class TranslationOrchestrator(QtCore.QObject):
                             translated_dict[idx] = final_translated
                             self.signals.preview_updated.emit(text_chunk, final_translated)
                             SessionManager.save_checkpoint(
-                                input_path, output_path, language, 0, translated_dict, glossary_entries,
+                                input_path, output_path, language, self.current_total_chunks, translated_dict, glossary_entries,
                                 toc=toc_entries, book_title=book_title
                             )
                             return final_translated
@@ -717,7 +717,7 @@ class TranslationOrchestrator(QtCore.QObject):
                 # Update UI preview and checkpoint with pure translated text
                 self.signals.preview_updated.emit(text_chunk, final_translated)
                 SessionManager.save_checkpoint(
-                    input_path, output_path, language, 0, translated_dict, glossary_entries,
+                    input_path, output_path, language, self.current_total_chunks, translated_dict, glossary_entries,
                     toc=toc_entries, book_title=book_title
                 )
                 return final_translated
@@ -756,13 +756,14 @@ class TranslationOrchestrator(QtCore.QObject):
                     DomChunker.chunk_body_preserving_structure(bd_pre, max_chars=configured_chunk_size)
                 )
 
+            self.current_total_chunks = total_epub_chunks
             already_done = len(translated_dict)
             logger.info(
                 f"EPUB 청크 사전 집계: 실제 청크 수={total_epub_chunks}, "
                 f"체크포인트 완료={already_done}"
             )
 
-            if already_done >= total_epub_chunks:
+            if already_done >= total_epub_chunks and total_epub_chunks > 0:
                 # All chunks already translated — rebuild EPUB from checkpoint directly.
                 logger.info(
                     f"[체크포인트 완전 재개] 체크포인트({already_done}개) >= "
@@ -793,7 +794,7 @@ class TranslationOrchestrator(QtCore.QObject):
                     ch_rebuild.set_content(rebuilt_r.encode('utf-8'))
             else:
                 for ch_idx, chapter in enumerate(chapters):
-                    if self.cancel_requested:
+                    if self.cancel_requested or self.is_paused or not self.is_running:
                         break
 
                     raw_content = chapter.get_content()
@@ -813,27 +814,38 @@ class TranslationOrchestrator(QtCore.QObject):
                     # Execute chapter chunks
                     ch_results = []
                     for g_idx, c_str in ch_tasks:
-                        if self.cancel_requested or not self.is_running:
+                        if self.cancel_requested or self.is_paused or not self.is_running:
                             break
                         res = await translate_single_chunk(g_idx, c_str)
-                        if res is None or self.cancel_requested or not self.is_running:
+                        if res is None or self.cancel_requested or self.is_paused or not self.is_running:
                             break
                         ch_results.append(res)
                         
                         self.signals.progress.emit(
                             len(translated_dict),
-                            global_chunk_idx,
-                            f"챕터 {ch_idx+1}/{total_chapters} 번역 중... ({len(translated_dict)} 청크 완료)"
+                            total_epub_chunks,
+                            f"챕터 {ch_idx+1}/{total_chapters} 번역 중... ({len(translated_dict)}/{total_epub_chunks} 청크 완료)"
                         )
 
-                    if self.cancel_requested or not self.is_running or len(ch_results) < len(ch_tasks):
+                    if self.cancel_requested or self.is_paused or not self.is_running or len(ch_results) < len(ch_tasks):
                         break
 
                     # HTML DOM reconstruction per chapter
                     rebuilt_html = EpubIO.rebuild_chapter_html(raw_html, ch_results)
                     chapter.set_content(rebuilt_html.encode('utf-8'))
 
-            if not self.cancel_requested and self.is_running:
+            # ---------------------------------------------------------------
+            # EPUB 최종 완료 엄격 검증 (Strict Completion Check)
+            # ---------------------------------------------------------------
+            is_epub_fully_completed = (
+                not self.cancel_requested and
+                not self.is_paused and
+                self.is_running and
+                total_epub_chunks > 0 and
+                len(translated_dict) == total_epub_chunks
+            )
+
+            if is_epub_fully_completed:
                 self.signals.status_changed.emit("목차(TOC) 동기화 및 EPUB 파일 저장 중...")
                 logger.info("Synchronizing and applying translated TOC to EPUB and metadata...")
                 
@@ -866,6 +878,17 @@ class TranslationOrchestrator(QtCore.QObject):
                     )
                 except Exception as _e_toc:
                     logger.warning(f"체크포인트 TOC 업데이트 건너뜀: {_e_toc}")
+            else:
+                # 미완성 상태: 절대 save_epub / cleanup_checkpoint을 수행하지 않고 체크포인트 보존
+                self.flush_checkpoint()
+                self.is_running = False
+                done_cnt = len(translated_dict)
+                pct = (done_cnt / total_epub_chunks * 100) if total_epub_chunks > 0 else 0
+                warn_msg = f"일시정지 또는 미완료 상태로 세션이 저장되었습니다 (완료: {done_cnt}/{total_epub_chunks} 청크, {pct:.1f}%)"
+                logger.warning(f"[세션 보존] {warn_msg}. 최종 EPUB 생성 및 체크포인트 정리를 중단하고 체크포인트를 안전하게 보존합니다.")
+                self.signals.log_emitted.emit("WARNING", f"⚠️ [미완료 세션 보존] {warn_msg}. 체크포인트가 보존되었습니다.")
+                self.signals.status_changed.emit(f"번역 일시정지 또는 미완료 ({done_cnt}/{total_epub_chunks}) - 체크포인트 보존됨")
+                return None
 
         # =========================================================================
         # TXT PARSED WORKFLOW
@@ -875,17 +898,32 @@ class TranslationOrchestrator(QtCore.QObject):
             txt_chunker = PlainTextChunker()
             chunks = txt_chunker.split_into_chunks(raw_content, max_size=configured_chunk_size)
             total_chunks = len(chunks)
+            self.current_total_chunks = total_chunks
 
             results = []
             for i in range(total_chunks):
-                if self.cancel_requested or not self.is_running:
+                if self.cancel_requested or self.is_paused or not self.is_running:
                     break
                 res = await translate_single_chunk(i, chunks[i])
-                if res is None or self.cancel_requested or not self.is_running:
+                if res is None or self.cancel_requested or self.is_paused or not self.is_running:
                     break
                 results.append(res)
+                self.signals.progress.emit(
+                    len(translated_dict),
+                    total_chunks,
+                    f"TXT 번역 중... ({len(translated_dict)}/{total_chunks} 청크 완료)"
+                )
 
-            if not self.cancel_requested and self.is_running and len(results) == total_chunks:
+            is_txt_fully_completed = (
+                not self.cancel_requested and
+                not self.is_paused and
+                self.is_running and
+                total_chunks > 0 and
+                len(translated_dict) == total_chunks and
+                len(results) == total_chunks
+            )
+
+            if is_txt_fully_completed:
                 final_text = "\n\n".join(results)
                 final_text = TextCleaner.strip_html_tags(final_text)
                 loop = asyncio.get_running_loop()
@@ -893,21 +931,47 @@ class TranslationOrchestrator(QtCore.QObject):
                 logger.info(f"🎉 번역 및 TXT 파일 생성이 완료되었습니다: {output_path}")
                 self.signals.log_emitted.emit("INFO", f"🎉 번역 및 TXT 파일 생성이 완료되었습니다: {output_path}")
                 self.signals.status_changed.emit(f"TXT 저장 완료: {output_path.name}")
+            else:
+                self.flush_checkpoint()
+                self.is_running = False
+                done_cnt = len(translated_dict)
+                pct = (done_cnt / total_chunks * 100) if total_chunks > 0 else 0
+                warn_msg = f"일시정지 또는 미완료 상태로 세션이 저장되었습니다 (완료: {done_cnt}/{total_chunks} 청크, {pct:.1f}%)"
+                logger.warning(f"[세션 보존] {warn_msg}. 최종 TXT 생성 및 체크포인트 정리를 중단하고 체크포인트를 안전하게 보존합니다.")
+                self.signals.log_emitted.emit("WARNING", f"⚠️ [미완료 세션 보존] {warn_msg}. 체크포인트가 보존되었습니다.")
+                self.signals.status_changed.emit(f"번역 일시정지 또는 미완료 ({done_cnt}/{total_chunks}) - 체크포인트 보존됨")
+                return None
 
-        if self.cancel_requested or not self.is_running:
+        # ---------------------------------------------------------------
+        # 최후의 방어선: Strict Completion Guard before cleanup_checkpoint
+        # ---------------------------------------------------------------
+        expected_total = total_epub_chunks if is_epub else total_chunks
+        final_completed_count = len(translated_dict)
+
+        if (
+            self.cancel_requested or
+            self.is_paused or
+            not self.is_running or
+            expected_total == 0 or
+            final_completed_count != expected_total
+        ):
+            self.flush_checkpoint()
             self.is_running = False
+            guard_msg = f"일시정지 또는 미완료 상태로 세션이 저장되었습니다 (완료: {final_completed_count}/{expected_total} 청크)"
+            logger.warning(f"[세션 보존 가드] {guard_msg}. 체크포인트 정리를 차단하고 상태를 보존합니다.")
+            self.signals.log_emitted.emit("WARNING", f"⚠️ [세션 보존] {guard_msg}")
+            self.signals.status_changed.emit(guard_msg)
             return None
 
-        # Cleanup temporary checkpoint & metadata files on clean finish
+        # 100% 완벽 검증 통과 시에만 임시 체크포인트 정리 실행
         try:
             SessionManager.cleanup_checkpoint(input_path)
-            logger.info("🧹 번역 완료: 임시 체크포인트 및 메타데이터 파일을 정리했습니다.")
+            logger.info(f"🧹 번역 100% 완료 ({final_completed_count}/{expected_total}): 임시 체크포인트 및 메타데이터 파일을 정리했습니다.")
             self.signals.log_emitted.emit("INFO", "🧹 번역 완료: 임시 체크포인트 및 메타데이터 파일을 정리했습니다.")
         except Exception as e_clean:
             logger.warning(f"임시 체크포인트 파일 정리 중 경고 (무시됨): {e_clean}")
 
-        total_done = len(translated_dict)
-        self.signals.progress.emit(total_done, total_done, "번역 완료!")
+        self.signals.progress.emit(final_completed_count, expected_total, "번역 완료!")
         self.signals.status_changed.emit("번역 작업이 성공적으로 완료되었습니다.")
         logger.info(f"[INFO] Translation completed successfully: {output_path}")
         self.signals.log_emitted.emit("INFO", f"[INFO] 번역 파이프라인 전체 완료: {output_path.name}")
