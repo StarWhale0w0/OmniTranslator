@@ -1,15 +1,71 @@
 """
 OmniTranslator Pro - EPUB DOM Structure-Preserving Chunker
 Chunks HTML/EPUB DOM hierarchy recursively while preserving tags and media elements.
+Ensures sentence boundary safety so trailing sentences never get truncated.
 """
 
 import copy
+import re
 from typing import Any, List
 from bs4 import BeautifulSoup, Tag, NavigableString
 from domain.chunkers.base_chunker import BaseChunker
 
 class DomChunker(BaseChunker):
     """Chunks HTML content preserving tag hierarchy, attributes, and media tags."""
+
+    SENTENCE_END_PATTERN = re.compile(
+        r'([。\.!\?！？…]+[\s\u3000]*[」』”"\'\)\]］]*|\n+)'
+    )
+
+    @classmethod
+    def split_text_by_sentence_boundary(cls, text: str, max_chars: int) -> List[str]:
+        """
+        Splits a string into safe sentence chunks not exceeding max_chars,
+        strictly prioritizing sentence terminators (., 。, !, ！, ?, ？) and closing quotes (」, 』, ", ').
+        Prevents sentences from being abruptly sliced in the middle.
+        """
+        if not text:
+            return []
+        if len(text) <= max_chars:
+            return [text]
+
+        chunks: List[str] = []
+        remaining = text
+
+        while len(remaining) > max_chars:
+            search_window = remaining[:max_chars]
+            matches = list(cls.SENTENCE_END_PATTERN.finditer(search_window))
+            best_split_idx = -1
+
+            if matches:
+                min_safe_pos = int(max_chars * 0.2)
+                for m in reversed(matches):
+                    end_pos = m.end()
+                    if end_pos >= min_safe_pos:
+                        best_split_idx = end_pos
+                        break
+                if best_split_idx == -1 and matches:
+                    best_split_idx = matches[-1].end()
+
+            # If no sentence boundary found, try comma or whitespace
+            if best_split_idx <= 0:
+                alt_match = re.search(r'([,、\s]+)[^,、\s]*$', search_window)
+                if alt_match and alt_match.start() >= int(max_chars * 0.3):
+                    best_split_idx = alt_match.end()
+
+            # Fallback to hard max_chars slice if no natural boundary
+            if best_split_idx <= 0:
+                best_split_idx = max_chars
+
+            chunk_part = remaining[:best_split_idx]
+            if chunk_part:
+                chunks.append(chunk_part)
+            remaining = remaining[best_split_idx:]
+
+        if remaining:
+            chunks.append(remaining)
+
+        return chunks
 
     @classmethod
     def _is_empty_node(cls, node: Any) -> bool:
@@ -24,7 +80,8 @@ class DomChunker(BaseChunker):
     def _split_oversized_tag(cls, tag: Tag, max_chars: int) -> List[Tag]:
         """
         Recursively splits an oversized Tag into smaller Tags of the same type/structure,
-        ensuring child tags or strings are properly distributed without exceeding max_chars.
+        ensuring child tags or strings are properly distributed without exceeding max_chars
+        and never slicing across incomplete sentences.
         """
         tag_str = str(tag)
         if len(tag_str) <= max_chars or cls.is_media_only_chunk(tag_str):
@@ -71,10 +128,11 @@ class DomChunker(BaseChunker):
                         result_chunks.append(wrapper_for_child)
                 elif isinstance(child, NavigableString):
                     text = str(child)
-                    for i in range(0, len(text), max_chars):
+                    sub_texts = cls.split_text_by_sentence_boundary(text, max_chars)
+                    for sub in sub_texts:
                         wrapper_for_text = tag.__copy__()
                         wrapper_for_text.clear()
-                        wrapper_for_text.append(text[i:i + max_chars])
+                        wrapper_for_text.append(sub)
                         result_chunks.append(wrapper_for_text)
                 else:
                     wrapper_for_other = tag.__copy__()
@@ -138,9 +196,10 @@ class DomChunker(BaseChunker):
                             chunks.append(sub)
                 elif isinstance(element, NavigableString):
                     text = str(element)
-                    for i in range(0, len(text), max_chars):
+                    sub_texts = cls.split_text_by_sentence_boundary(text, max_chars)
+                    for sub in sub_texts:
                         new_tag = BeautifulSoup("<div></div>", "html.parser").div
-                        new_tag.append(text[i:i + max_chars])
+                        new_tag.append(sub)
                         chunks.append(new_tag)
                 else:
                     chunks.append(element)

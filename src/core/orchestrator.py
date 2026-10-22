@@ -592,15 +592,29 @@ class TranslationOrchestrator(QtCore.QObject):
                         f"⚠️ Chunk #{idx+1}: Gemini 시도 실패 ({last_issue}) -> 2차 폴백 번역(구글 번역) 호출 중..."
                     )
 
-                    # 1) Try translating masked text with FallbackTranslator to preserve tags
-                    fb_trans = await FallbackTranslator.translate_async(
-                        masked_text,
-                        source_lang=language.upper(),
-                        target_lang="KO"
-                    )
+                    fb_unmasked = None
 
-                    # 2) If masked translation failed or tags corrupt, try unmasked clean source text
-                    if not fb_trans or not fb_trans.strip():
+                    # 1) If EPUB HTML, translate translatable text nodes only to completely prevent tag corruption
+                    if is_epub and '<' in text_chunk:
+                        logger.info(f"Chunk #{idx+1}: EPUB HTML 순수 text_node 분리 폴백 번역 시도...")
+                        fb_unmasked = await FallbackTranslator.translate_html_async(
+                            text_chunk,
+                            source_lang=language.upper(),
+                            target_lang="KO"
+                        )
+
+                    # 2) Fallback to masked text translation if DOM approach was not applicable or failed
+                    if not fb_unmasked or not fb_unmasked.strip():
+                        fb_trans = await FallbackTranslator.translate_async(
+                            masked_text,
+                            source_lang=language.upper(),
+                            target_lang="KO"
+                        )
+                        if fb_trans and fb_trans.strip():
+                            fb_unmasked = TagMasker.unmask_tags(fb_trans, tag_map)
+
+                    # 3) Last resort: unmasked clean source text
+                    if not fb_unmasked or not fb_unmasked.strip():
                         pure_src = TagMasker.unmask_tags(masked_text, tag_map)
                         clean_src_for_fb = QualityChecker.extract_clean_text(pure_src)
                         if clean_src_for_fb.strip():
@@ -609,21 +623,34 @@ class TranslationOrchestrator(QtCore.QObject):
                                 source_lang=language.upper(),
                                 target_lang="KO"
                             )
+                            if fb_trans and fb_trans.strip():
+                                fb_unmasked = fb_trans
 
-                    # 3) Validate Fallback result
-                    if fb_trans and fb_trans.strip():
-                        fb_unmasked = TagMasker.unmask_tags(fb_trans, tag_map)
+                    # 4) Validate & Post-process Fallback result
+                    if fb_unmasked and fb_unmasked.strip():
+                        # Clean stuttering ("이미 이미") and format artifacts
+                        fb_unmasked = TextCleaner.clean_text(fb_unmasked, profile.get_cleaner_patterns())
+
+                        # CRITICAL FIX: Enforce Glossary Post-Correction & Korean Josa Repair on Fallback results!
+                        if glossary_entries and use_glossary:
+                            fb_unmasked = GlossaryCorrector.correct_text(
+                                source_text=text_chunk,
+                                translated_text=fb_unmasked,
+                                glossary_entries=glossary_entries,
+                                lang_code=language
+                            )
+
                         if not is_epub:
                             fb_unmasked = TextCleaner.strip_html_tags(fb_unmasked)
 
                         is_fb_valid, fb_invalid_reason = SessionManager.is_chunk_valid(fb_unmasked)
                         if is_fb_valid:
                             logger.info(
-                                f"Chunk #{idx+1}: [2차 폴백 성공] 구글 번역 대체 완료 ({len(fb_unmasked)}자)."
+                                f"Chunk #{idx+1}: [2차 폴백 성공] 구글 번역 대체 및 용어집 교정 완료 ({len(fb_unmasked)}자)."
                             )
                             self.signals.log_emitted.emit(
                                 "INFO",
-                                f"Chunk #{idx+1}: [2차 폴백 성공] Gemini 실패 구간을 구글 번역으로 대체 완료."
+                                f"Chunk #{idx+1}: [2차 폴백 성공] Gemini 실패 구간을 구글 번역(용어집 교정 완료)으로 대체 완료."
                             )
                             final_translated = fb_unmasked
                             translated_dict[idx] = final_translated
@@ -684,18 +711,34 @@ class TranslationOrchestrator(QtCore.QObject):
                         f"Chunk #{idx+1}: Gemini 산출물 최종 무결성 검증 탈락 ({invalid_reason}). "
                         f"2차 폴백 번역(구글 번역)으로 긴급 구제 시도..."
                     )
-                    fb_rescue = await FallbackTranslator.translate_async(
-                        masked_text,
-                        source_lang=language.upper(),
-                        target_lang="KO"
-                    )
+                    if is_epub and '<' in text_chunk:
+                        fb_rescue = await FallbackTranslator.translate_html_async(
+                            text_chunk,
+                            source_lang=language.upper(),
+                            target_lang="KO"
+                        )
+                    else:
+                        fb_raw = await FallbackTranslator.translate_async(
+                            masked_text,
+                            source_lang=language.upper(),
+                            target_lang="KO"
+                        )
+                        fb_rescue = TagMasker.unmask_tags(fb_raw, tag_map) if fb_raw else None
+
                     if fb_rescue and fb_rescue.strip():
-                        fb_unmasked = TagMasker.unmask_tags(fb_rescue, tag_map)
+                        fb_unmasked = TextCleaner.clean_text(fb_rescue, profile.get_cleaner_patterns())
+                        if glossary_entries and use_glossary:
+                            fb_unmasked = GlossaryCorrector.correct_text(
+                                source_text=text_chunk,
+                                translated_text=fb_unmasked,
+                                glossary_entries=glossary_entries,
+                                lang_code=language
+                            )
                         if not is_epub:
                             fb_unmasked = TextCleaner.strip_html_tags(fb_unmasked)
                         is_fb_valid, _ = SessionManager.is_chunk_valid(fb_unmasked)
                         if is_fb_valid:
-                            logger.info(f"Chunk #{idx+1}: 2차 폴백 번역으로 성공적 긴급 구제 완료.")
+                            logger.info(f"Chunk #{idx+1}: 2차 폴백 번역으로 성공적 긴급 구제 완료 (용어집 적용).")
                             final_translated = fb_unmasked
                             is_valid = True
 

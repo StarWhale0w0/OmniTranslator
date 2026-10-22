@@ -3,6 +3,7 @@ OmniTranslator Pro - Fallback Translator Engine
 Provides secondary machine translation (GoogleTranslator via deep-translator and direct HTTP endpoint)
 when Gemini encounters safety blocks (PROMPT_BLOCKED) or empty responses.
 Never returns raw source text on failure; returns None if translation fails.
+Supports DOM-aware text node translation for EPUB/HTML chunks to completely prevent tag corruption.
 """
 
 import asyncio
@@ -31,7 +32,7 @@ class FallbackTranslator:
         if not text or not text.strip():
             return None
 
-        # Split into smaller blocks if text exceeds ~3000 chars to avoid URL length issues
+        # Split into smaller blocks if text exceeds ~2000 chars to avoid URL length issues
         max_block = 2000
         paragraphs = text.split("\n")
         chunks: List[str] = []
@@ -101,7 +102,7 @@ class FallbackTranslator:
             if result and result.strip() and result.strip() != text.strip():
                 # Verify that translation actually contains Korean characters
                 hangul_count = len(re.findall(r'[\uac00-\ud7af]', result))
-                if hangul_count >= 5 or len(result) < 15:
+                if hangul_count >= 3 or len(result) < 15:
                     logger.info(f"Fallback GoogleTranslator (deep-translator) succeeded: {len(text)} -> {len(result)} chars.")
                     return result
         except Exception as e:
@@ -112,7 +113,7 @@ class FallbackTranslator:
             gtx_result = await loop.run_in_executor(None, lambda: cls._translate_gtx_sync(text, src, tgt))
             if gtx_result and gtx_result.strip() and gtx_result.strip() != text.strip():
                 hangul_count = len(re.findall(r'[\uac00-\ud7af]', gtx_result))
-                if hangul_count >= 5 or len(gtx_result) < 15:
+                if hangul_count >= 3 or len(gtx_result) < 15:
                     logger.info(f"Fallback GoogleTranslator (direct GTX) succeeded: {len(text)} -> {len(gtx_result)} chars.")
                     return gtx_result
         except Exception as e:
@@ -121,3 +122,86 @@ class FallbackTranslator:
         # Translation completely failed - return None to explicitly signal failure
         logger.error(f"All FallbackTranslator channels failed for {len(text)} chars.")
         return None
+
+    @classmethod
+    async def translate_html_async(
+        cls,
+        html_content: str,
+        source_lang: str = "JA",
+        target_lang: str = "KO"
+    ) -> Optional[str]:
+        """
+        Translates HTML chunk by isolating text nodes, translating pure text nodes only,
+        and re-inserting translated text back into the DOM structure.
+        This completely prevents HTML/media tag corruption and tag masking leakage.
+        """
+        if not html_content or not html_content.strip():
+            return html_content
+
+        if '<' not in html_content:
+            return await cls.translate_async(html_content, source_lang=source_lang, target_lang=target_lang)
+
+        from bs4 import BeautifulSoup, NavigableString
+
+        # Flatten ruby tags first
+        try:
+            from domain.epub.ruby_processor import RubyProcessor
+            processed_html = RubyProcessor.flatten_ruby_html(html_content)
+        except Exception:
+            processed_html = html_content
+
+        try:
+            soup = BeautifulSoup(processed_html, 'html.parser')
+        except Exception as e:
+            logger.warning(f"Failed to parse HTML for node-level translation: {e}. Falling back to standard translation.")
+            return await cls.translate_async(processed_html, source_lang=source_lang, target_lang=target_lang)
+
+        # Collect translatable text nodes
+        ignored_tags = {'head', 'title', 'meta', 'link', 'style', 'script'}
+        text_nodes = []
+        for s in list(soup.descendants):
+            if isinstance(s, NavigableString) and not isinstance(s.parent, (type(None),)):
+                if s.parent and s.parent.name in ignored_tags:
+                    continue
+                raw_text = str(s)
+                if raw_text.strip():
+                    text_nodes.append((s, raw_text))
+
+        if not text_nodes:
+            return processed_html
+
+        # Delimiter-based batch translation
+        DELIMITER = "\n---OMNI_NODE_SPLIT---\n"
+        texts_to_translate = [t for _, t in text_nodes]
+        joined_payload = DELIMITER.join(texts_to_translate)
+
+        translated_payload = await cls.translate_async(
+            joined_payload,
+            source_lang=source_lang,
+            target_lang=target_lang
+        )
+
+        translated_parts = None
+        if translated_payload:
+            parts = re.split(r'\n?\s*---\s*OMNI_NODE_SPLIT\s*---\s*\n?', translated_payload, flags=re.IGNORECASE)
+            if len(parts) == len(text_nodes):
+                translated_parts = [p.strip() for p in parts]
+
+        # If delimiter batching failed or count mismatched, fallback to parallel per-node translation
+        if not translated_parts:
+            logger.info(f"Batch delimiter translation mismatch. Falling back to concurrent per-node translation ({len(text_nodes)} nodes)...")
+            async def _trans_single(txt: str) -> str:
+                res = await cls.translate_async(txt.strip(), source_lang=source_lang, target_lang=target_lang)
+                return res.strip() if res else txt
+
+            translated_parts = await asyncio.gather(*[_trans_single(t) for _, t in text_nodes])
+
+        # Replace text in DOM
+        for (node, orig_text), trans_text in zip(text_nodes, translated_parts):
+            if trans_text:
+                # Preserve leading/trailing whitespace if present in original text
+                leading = orig_text[:len(orig_text) - len(orig_text.lstrip())]
+                trailing = orig_text[len(orig_text.rstrip()):]
+                node.replace_with(f"{leading}{trans_text}{trailing}")
+
+        return str(soup)

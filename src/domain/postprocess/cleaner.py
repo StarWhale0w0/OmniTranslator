@@ -209,6 +209,9 @@ class TextCleaner:
         cleaned = re.sub(r'웅둘째\s*형', '웅얼거', cleaned)
         cleaned = re.sub(r'흥둘째\s*형', '흥얼거', cleaned)
 
+        # D. Remove stuttering / duplicate adverb hallucinations (e.g. "이미 이미" -> "이미", "벌써 벌써" -> "벌써")
+        cleaned = re.sub(r'(?<![가-힣])(이미|벌써|다시|정말|진짜|항상|매번|지금)\s+\1(?![가-힣])', r'\1', cleaned)
+
         # 5.7. Refine dialogue tone and sentence endings within quotes
         from domain.postprocess.dialogue_tone_corrector import DialogueToneCorrector
         cleaned = DialogueToneCorrector.refine_dialogue_text(cleaned)

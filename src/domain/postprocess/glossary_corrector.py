@@ -34,7 +34,14 @@ HANJA_READINGS: Dict[str, str] = {
     '生': '생', '死': '사', '轮': '륜', '輪': '륜', '回': '회', '宗': '종', '门': '문', '門': '문',
     '派': '파', '帮': '방', '幫': '방', '谷': '곡', '峰': '봉', '阁': '각', '閣': '각', '殿': '전',
     '城': '성', '国': '국', '國': '국', '府': '부', '院': '원', '界': '계', '域': '역', '海': '해',
-    '荒': '황', '古': '고', '圣': '성', '聖': '성', '皇': '황', '王': '왕', '侯': '후', '将': '장',
+    '荒': '황', '古': '고', '圣': '성', '聖': '성', '皇': '황', '王': '왕', '侯': '후', '将': '장', '匠': '장', '巧': '교', '拓': '탁',
+    '恋': '련', '咲': '소', '綾': '릉', '遥': '요', '優': '우', '美': '미', '奈': '나', '菜': '채', '楓': '풍', '葵': '규', '凛': '름',
+    '蓮': '련', '真': '진', '翔': '상', '湊': '주', '悠': '유', '結': '결', '芽': '아', '莉': '리', '栞': '간', '汐': '석', '渚': '저',
+    '透': '투', '響': '향', '涼': '량', '尋': '심', '紗': '사', '織': '직', '香': '향', '薫': '훈', '歩': '보', '隼': '준', '颯': '삽',
+    '翼': '익', '雫': '적', '霞': '하', '蛍': '형', '紬': '주', '詩': '시', '琴': '금', '音': '음', '乃': '내', '澪': '령', '絃': '현',
+    '弦': '현', '鈴': '령', '燈': '등', '灯': '등', '緋': '비', '瑠': '류', '璃': '리', '碧': '벽', '翠': '취', '琥': '호', '珀': '백',
+    '蒼': '창', '桜': '앵', '梢': '초', '柊': '종', '柚': '유', '杏': '행', '桃': '도', '梨': '리', '菫': '근', '藤': '등', '橘': '귤',
+    '桐': '동', '椿': '춘', '樹': '수', '橋': '교',
     '帅': '수', '帥': '수', '相': '상', '师': '사', '師': '사', '徒': '도', '兄': '형', '弟': '제',
     '姐': '저', '妹': '매', '父': '부', '母': '모', '子': '자', '女': '녀', '老': '로', '少': '소',
     '赵': '조', '趙': '조', '钱': '전', '錢': '전', '孙': '손', '孫': '손', '周': '주', '吴': '오',
@@ -150,6 +157,44 @@ class GlossaryCorrector:
         return "".join(HANJA_READINGS.get(c, c) for c in norm_str)
 
     @classmethod
+    def get_ja_candidate_variants(cls, ja_term: str) -> List[str]:
+        """
+        Generates erroneous representations for Japanese terms:
+        1. Sino-Korean Hanja readings (e.g. 将人 -> 장인, 恋海 -> 연해, 星良 -> 성량, 拓海 -> 탁해)
+        2. Literal noun/semantic translations (e.g. 匠 -> 장인, 巧 -> 솜씨)
+        """
+        if not ja_term:
+            return []
+
+        variants = [ja_term]
+        norm = unicodedata.normalize('NFKC', ja_term)
+        if norm != ja_term:
+            variants.append(norm)
+
+        # 1. Sino-Korean reading (한국 한자음)
+        hanja_base = cls.to_hanja_reading(ja_term)
+        if hanja_base and hanja_base != ja_term:
+            variants.append(hanja_base)
+            if hanja_base[0] in INITIAL_SOUND_RULES:
+                initial_fixed = INITIAL_SOUND_RULES[hanja_base[0]] + hanja_base[1:]
+                variants.append(initial_fixed)
+
+        # 2. Literal semantic translation for common Japanese name kanji
+        SEMANTIC_LITERAL_MAP = {
+            '匠': ['장인'],
+            '巧': ['솜씨', '기교'],
+            '拓海': ['탁해'],
+        }
+        for k, sem_list in SEMANTIC_LITERAL_MAP.items():
+            if k == ja_term:
+                variants.extend(sem_list)
+            elif k in ja_term:
+                for sem in sem_list:
+                    variants.append(ja_term.replace(k, sem))
+
+        return list(set(v for v in variants if v))
+
+    @classmethod
     def get_candidate_variants(cls, chinese_term: str) -> List[str]:
         """Generates possible erroneous representations (raw term, Sino-Korean reading, initial sound variants)."""
         if not chinese_term:
@@ -200,12 +245,18 @@ class GlossaryCorrector:
             return f'{prefix}{josa}{suffix}'
         text = re.compile(rf'({escaped_word})(?:이었|였)([다전자고지음습].*?|(?=[^가-힣]|$))').sub(fix_yeot, text)
 
-        # 3. 이에요/예요
+        # 3. 이에요/예요, 이야말로/야말로
         def fix_eyo(m):
             prefix = m.group(1)
             josa = '이에요' if has_jong else '예요'
             return f'{prefix}{josa}'
         text = re.compile(rf'({escaped_word})(?:이에요|예요)(?=[^가-힣]|$)').sub(fix_eyo, text)
+
+        def fix_yamallo(m):
+            prefix = m.group(1)
+            josa = '이야말로' if has_jong else '야말로'
+            return f'{prefix}{josa}'
+        text = re.compile(rf'({escaped_word})(?:이야말로|야말로)(?=[^가-힣]|$)').sub(fix_yamallo, text)
 
         # 4. 이라/라 variants (이라고/라고, 이라는/라는, 이라며/라며, 이라면/라면, 이라도/라도, 이라서/라서, 이라니/라니)
         def fix_ira(m):
@@ -215,7 +266,13 @@ class GlossaryCorrector:
             return f'{prefix}{josa}{particle_type}'
         text = re.compile(rf'({escaped_word})(?:이라|라)([고는며면도서니]|(?=[^가-힣]|$))').sub(fix_ira, text)
 
-        # 5. 이란/란, 이나/나, 이든/든, 이며/며
+        # 5. 이란/란, 이나/나, 이든/든, 이며/며, 이니까/니까
+        def fix_inikka(m):
+            prefix = m.group(1)
+            josa = '이니까' if has_jong else '니까'
+            return f'{prefix}{josa}'
+        text = re.compile(rf'({escaped_word})(?:이니까|니까)(?=[^가-힣]|$)').sub(fix_inikka, text)
+
         def fix_iran(m):
             prefix = m.group(1)
             josa = '이란' if has_jong else '란'
@@ -337,13 +394,23 @@ class GlossaryCorrector:
             if kw != tr:
                 replacement_map.append((kw, tr))
 
-            # Candidate B: Hanja readings and variations (e.g. 종구, 소염, 임동)
+            # Candidate B: Hanja readings and variations (e.g. 종구, 소염, 임동 / 장인, 연해)
             if lang_code.upper() == "ZH":
                 candidates = cls.get_candidate_variants(kw)
                 for cand in candidates:
                     # Avoid 1-character replacements to prevent aggressive false positives
                     if cand and cand != tr and (len(cand) >= 2 or cand == kw):
                         replacement_map.append((cand, tr))
+            elif lang_code.upper() == "JA":
+                candidates = cls.get_ja_candidate_variants(kw)
+                for cand in candidates:
+                    if cand and cand != tr and (len(cand) >= 2 or cand == kw):
+                        replacement_map.append((cand, tr))
+                        # Also handle common Korean honorific suffixes mistranslated from -san/-senpai
+                        # e.g., '장인 씨' -> '마사토 씨', '장인씨' -> '마사토 씨'
+                        if item.get("category") == "인명" or len(cand) >= 2:
+                            for suffix in [" 씨", "씨", " 선배", "선배", " 님", "님", " 군", "군", " 양", "양"]:
+                                replacement_map.append((cand + suffix, tr + suffix))
 
         # Sort replacement patterns by length descending to prevent substring collisions
         replacement_map.sort(key=lambda x: len(x[0]), reverse=True)
@@ -351,7 +418,7 @@ class GlossaryCorrector:
         # 4. Perform replacements with boundary protection
         # For pure Hangul candidate patterns, enforce word boundary / non-Hangul lookbehind
         # to strictly avoid corrupting composite words (e.g., '중얼거리다' getting corrupted by '얼거')
-        korean_josa_suffix = r'(?:은|는|이|가|을|를|과|와|으로|로|에서|서|에게|께|에|의|도|만|뿐|이나|나|이란|란|이라|라|이며|며|이든|든|이었|였|이에요|예요|아|야|처럼|마저|조차|부터|까지|하고)?'
+        korean_josa_suffix = r'(?:은|는|이|가|을|를|과|와|으로|로|에서|서|에게|께|에|의|도|만|뿐|이나|나|이란|란|이라|라|이며|며|이든|든|이었|였|이에요|예요|아|야|처럼|마저|조차|부터|까지|하고|이야말로|야말로|한테|더러|치고|보다|마냥|커녕|이니까|니까)?'
         
         for pattern, target in replacement_map:
             if not pattern or pattern not in result:
