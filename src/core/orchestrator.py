@@ -434,6 +434,20 @@ class TranslationOrchestrator(QtCore.QObject):
                 best_qc_score = -99999.0
 
                 # 4. Primary Translation: Gemini API with Quality-Check Retry & Key Failover Loop
+                if self.key_manager.all_keys_exhausted():
+                    logger.error(
+                        f"Chunk #{idx+1}: 모든 Gemini API 키 할당량 소진 감지 (전체 키 429 쿨다운). "
+                        f"기계번역 대체 방지 및 Safe Pause로 즉시 전환합니다."
+                    )
+                    self.signals.log_emitted.emit(
+                        "ERROR",
+                        f"🚨 [모든 API 키 할당량 소진] 모든 Gemini 키가 429/할당량 초과로 쿨다운 상태입니다.\n"
+                        f"기계번역(구글 번역) 대체 저장을 차단하고 Gemini 키 복구 대기를 위해 작업을 안전 일시정지합니다."
+                    )
+                    self.signals.status_changed.emit("모든 API 키 할당량 소진: Gemini 키 복구 대기를 위해 작업을 일시정지합니다")
+                    self.pause()
+                    return None
+
                 for gemini_att in range(max_gemini_qc_retries):
                     try:
                         init_temp = self.config.get("temperature", 0.3)
@@ -445,6 +459,19 @@ class TranslationOrchestrator(QtCore.QObject):
                             thinking_budget=None,
                             system_instruction=current_sys_instruction
                         )
+
+                        if self.key_manager.all_keys_exhausted():
+                            logger.error(
+                                f"Chunk #{idx+1}: API 호출 후 모든 Gemini 키 429 쿨다운 감지. Safe Pause로 즉시 전환합니다."
+                            )
+                            self.signals.log_emitted.emit(
+                                "ERROR",
+                                f"🚨 [모든 API 키 할당량 소진] 모든 Gemini 키가 429/할당량 초과로 쿨다운 상태입니다.\n"
+                                f"기계번역(구글 번역) 대체 저장을 차단하고 Gemini 키 복구 대기를 위해 작업을 안전 일시정지합니다."
+                            )
+                            self.signals.status_changed.emit("모든 API 키 할당량 소진: Gemini 키 복구 대기를 위해 작업을 일시정지합니다")
+                            self.pause()
+                            return None
 
                         # If Gemini returned empty text
                         if not result_raw or not result_raw.strip() or result_raw.strip() == masked_text.strip():
@@ -582,7 +609,38 @@ class TranslationOrchestrator(QtCore.QObject):
                 # 4.4. Secondary Fallback: FallbackTranslator (Google Translator via GTX/deep-translator)
                 # Gemini 응답 부재 / 품질 미달 시 2차 폴백 번역을 즉시 호출
                 if not gemini_success:
+                    if self.key_manager.all_keys_exhausted():
+                        logger.error(
+                            f"Chunk #{idx+1}: 모든 Gemini API 키 할당량 소진(429 RESOURCE_EXHAUSTED/쿨다운). "
+                            f"저급 기계번역 오염 방지를 위해 작업을 안전 일시정지합니다."
+                        )
+                        self.signals.log_emitted.emit(
+                            "ERROR",
+                            f"🚨 [모든 API 키 할당량 소진] 모든 Gemini 키가 429/할당량 초과로 쿨다운 상태입니다.\n"
+                            f"기계번역(구글 번역) 대체 저장을 차단하고 Gemini 키 복구 대기를 위해 작업을 안전 일시정지합니다."
+                        )
+                        self.signals.status_changed.emit("모든 API 키 할당량 소진: Gemini 키 복구 대기를 위해 작업을 일시정지합니다")
+                        self.pause()
+                        return None
+
+                    allow_fallback = bool(self.config.get("allow_machine_fallback", False) or self.config.get("enable_fallback", False))
+                    is_short_snippet = pure_len <= 30
                     last_issue = qc_result.get("issue", "품질 검사 미달") if 'qc_result' in locals() else "Gemini 응답 부재"
+
+                    if not allow_fallback and not is_short_snippet:
+                        logger.warning(
+                            f"Chunk #{idx+1}: Gemini 번역 실패 ({last_issue}). "
+                            f"소설 본문 품질 보호를 위해 기계번역(구글 번역) 대체 저장을 차단하고 작업을 안전 일시정지합니다."
+                        )
+                        self.signals.log_emitted.emit(
+                            "ERROR",
+                            f"🚨 [번역 일시정지] Chunk #{idx+1}: Gemini 번역 실패 ({last_issue}).\n"
+                            f"저급 기계번역 직역 오염을 방지하기 위해 구글 번역 자동 저장을 차단하고 작업을 안전 일시정지합니다."
+                        )
+                        self.signals.status_changed.emit(f"Chunk #{idx+1} Gemini 번역 실패 (기계번역 대체 차단됨)")
+                        self.pause()
+                        return None
+
                     logger.warning(
                         f"Chunk #{idx+1}: Gemini {max_gemini_qc_retries}회 재시도 실패 ({last_issue}). "
                         f"2차 폴백 번역(구글 번역) 즉시 호출..."
@@ -707,6 +765,34 @@ class TranslationOrchestrator(QtCore.QObject):
                 # 6. Final Integrity Validation before saving to Checkpoint
                 is_valid, invalid_reason = SessionManager.is_chunk_valid(final_translated, lang_code=language)
                 if not is_valid:
+                    if self.key_manager.all_keys_exhausted():
+                        logger.error(
+                            f"Chunk #{idx+1}: 최종 무결성 검증 탈락 및 모든 Gemini 키 할당량 소진. "
+                            f"기계번역 대체 저장을 차단하고 작업을 안전 일시정지합니다."
+                        )
+                        self.signals.log_emitted.emit(
+                            "ERROR",
+                            f"🚨 [모든 API 키 할당량 소진] 모든 Gemini 키가 429/할당량 초과로 쿨다운 상태입니다.\n"
+                            f"기계번역(구글 번역) 대체 저장을 차단하고 Gemini 키 복구 대기를 위해 작업을 안전 일시정지합니다."
+                        )
+                        self.signals.status_changed.emit("모든 API 키 할당량 소진: Gemini 키 복구 대기를 위해 작업을 일시정지합니다")
+                        self.pause()
+                        return None
+
+                    allow_fallback = bool(self.config.get("allow_machine_fallback", False) or self.config.get("enable_fallback", False))
+                    is_short_snippet = pure_len <= 30
+                    if not allow_fallback and not is_short_snippet:
+                        abort_reason = f"Chunk #{idx+1} 최종 산출물 무결성 검증 실패: {invalid_reason}"
+                        logger.error(f"[FAIL-FAST] {abort_reason}. 기계번역 대체 저장을 차단하고 작업을 일시 정지합니다.")
+                        self.signals.log_emitted.emit(
+                            "ERROR",
+                            f"🚨 [번역 일시 정지] Chunk #{idx+1}: {invalid_reason}\n"
+                            f"소설 품질 보호를 위해 기계번역 대체 저장을 차단하고 작업을 일시 정지했습니다."
+                        )
+                        self.signals.status_changed.emit(f"Chunk #{idx+1} 품질 기준 미달로 일시 정지됨")
+                        self.pause()
+                        return None
+
                     logger.warning(
                         f"Chunk #{idx+1}: Gemini 산출물 최종 무결성 검증 탈락 ({invalid_reason}). "
                         f"2차 폴백 번역(구글 번역)으로 긴급 구제 시도..."

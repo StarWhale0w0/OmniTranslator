@@ -36,6 +36,20 @@ class SessionManager:
     KATAKANA_REGEX = re.compile(r'[\u30a0-\u30ff]')
     JP_CHAR_REGEX = re.compile(r'[\u3040-\u309f\u30a0-\u30ff]')
     HANGUL_REGEX = re.compile(r'[\uac00-\ud7af]')
+    GTX_POLLUTION_REGEX = re.compile(
+        r'(?:'
+        r'유석에|'
+        r'후무후무|'
+        r'남자\s*사람|'
+        r'책장(?:을|를)?\s*낚시|'
+        r'기뻐\s*용감하고|'
+        r'파격의\s*이마|'
+        r'확실히\s*끊으려고|'
+        r'숙제의\s*대답|'
+        r'일단\s*뿌려|'
+        r'초울트라\s*해피'
+        r')'
+    )
 
     @classmethod
     def is_chunk_valid(cls, chunk_text: str, lang_code: Optional[str] = "JA") -> Tuple[bool, Optional[str]]:
@@ -88,6 +102,11 @@ class SessionManager:
             if hangul_count < 10 and jp_count > 0:
                 sample_jp = "".join(jp_matches[:10])
                 return False, f"한글 부족({hangul_count}자) 및 미번역 일본어 문자({jp_count}자) 잔존 ('{sample_jp}...'): 즉시 거부"
+
+            # (3) 구글 번역(GTX) 저급 직역 오염 찌꺼기 검출 시 즉시 False
+            if cls.GTX_POLLUTION_REGEX.search(chunk_text):
+                found_gtx = list(set(cls.GTX_POLLUTION_REGEX.findall(chunk_text)))
+                return False, f"구글 번역(GTX) 저급 직역 오염 검출 ({', '.join(found_gtx)})"
 
         # ── 2. 한자(Hanja/CJK) 원문 잔존 검증 ────────────────────────────────
         # Exclude legitimate bracketed Hanja annotations (e.g. 양강패절(陽剛霸絕))

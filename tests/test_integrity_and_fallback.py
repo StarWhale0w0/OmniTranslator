@@ -148,5 +148,34 @@ class TestTranslationIntegrityAndFallback(unittest.TestCase):
         self.assertTrue(qc_res.get("is_untranslated_japanese", False))
         self.assertIn("UNTRANSLATED_JAPANESE_DETECTED", qc_res["issue"])
 
+    def test_session_manager_rejects_gtx_mistranslations(self):
+        # 1. '유석에' & '후무후무' & '책장을 낚시' & '남자 사람'
+        bad_chunk_1 = "<p>유석에 1개로 부탁합니다! 이건 남자 사람이라도 즐길 수 있어요. 후무후무, 책장을 낚시하러 갔다.</p>"
+        valid1, reason1 = SessionManager.is_chunk_valid(bad_chunk_1, lang_code="JA")
+        self.assertFalse(valid1)
+        self.assertIn("구글 번역(GTX) 저급 직역 오염 검출", reason1)
+
+        # 2. '파격의 이마' & '기뻐 용감하고'
+        bad_chunk_2 = "<p>가정 교사의 아르바이트로서는 파격의 이마를 받고 있기 때문에 기뻐 용감하고 달려갔다.</p>"
+        valid2, reason2 = SessionManager.is_chunk_valid(bad_chunk_2, lang_code="JA")
+        self.assertFalse(valid2)
+        self.assertIn("구글 번역(GTX) 저급 직역 오염 검출", reason2)
+
+    def test_key_manager_all_keys_exhausted_detection(self):
+        from infra.key_manager import KeyManager
+        import time
+
+        km = KeyManager(api_keys=["key1", "key2"])
+        self.assertFalse(km.all_keys_exhausted())
+
+        # Put all keys in cooldown (simulate 429 quota exhaustion)
+        km.key_cooldowns["key1"] = time.time() + 100.0
+        km.key_cooldowns["key2"] = time.time() + 100.0
+        self.assertTrue(km.all_keys_exhausted())
+
+        # Reset cooldowns
+        km.reset_cooldowns()
+        self.assertFalse(km.all_keys_exhausted())
+
 if __name__ == "__main__":
     unittest.main()
