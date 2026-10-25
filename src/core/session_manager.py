@@ -32,9 +32,13 @@ class SessionManager:
     )
     UNMASKED_TAG_REGEX = re.compile(r'\[\s*TAG\s*_?\s*\d+\s*\]', re.IGNORECASE)
     HANJA_REGEX = re.compile(r'[\u4e00-\u9fff]')
+    HIRAGANA_REGEX = re.compile(r'[\u3040-\u309f]')
+    KATAKANA_REGEX = re.compile(r'[\u30a0-\u30ff]')
+    JP_CHAR_REGEX = re.compile(r'[\u3040-\u309f\u30a0-\u30ff]')
+    HANGUL_REGEX = re.compile(r'[\uac00-\ud7af]')
 
     @classmethod
-    def is_chunk_valid(cls, chunk_text: str) -> Tuple[bool, Optional[str]]:
+    def is_chunk_valid(cls, chunk_text: str, lang_code: Optional[str] = "JA") -> Tuple[bool, Optional[str]]:
         """
         Validates if a translated chunk is clean and uncontaminated.
         Returns: (is_valid, corruption_reason)
@@ -58,9 +62,34 @@ class SessionManager:
         if "<!-- [번역경고]" in chunk_text or "[번역경고]" in chunk_text or "[품질경고:" in chunk_text:
             return False, "번역 실패/미변환 경고 태그 잔존 (<!-- [번역경고] -->)"
 
-        # Check for untranslated Hanja (CJK) ideographs
         clean_body = re.sub(r'<[^>]+>', '', chunk_text)
         clean_body = re.sub(r'\[\s*TAG\s*_?\s*\d+\s*\]', '', clean_body, flags=re.IGNORECASE)
+
+        hangul_matches = cls.HANGUL_REGEX.findall(clean_body)
+        hangul_count = len(hangul_matches)
+
+        # ── 1. 일본어(JA) 전용 무결성 검증 (히라가나/가타카나 잔존 검출) ────────
+        is_ja = False
+        if lang_code is None:
+            is_ja = True  # 기본 세션 언어를 JA로 간주하여 방어
+        elif str(lang_code).strip().upper() in ("JA", "JP", "JAPANESE"):
+            is_ja = True
+
+        if is_ja:
+            jp_matches = cls.JP_CHAR_REGEX.findall(clean_body)
+            jp_count = len(jp_matches)
+
+            # (1) 번역문 전체에서 히라가나/가타카나가 3자 이상 검출되면 무조건 False (미번역 잔존 거부)
+            if jp_count >= 3:
+                sample_jp = "".join(jp_matches[:10])
+                return False, f"미번역 히라가나/가타카나 {jp_count}자 검출 ('{sample_jp}...'): 미번역 잔존 거부"
+
+            # (2) 한글이 10자 미만인데 일본어 문자가 존재하는 경우 즉시 False
+            if hangul_count < 10 and jp_count > 0:
+                sample_jp = "".join(jp_matches[:10])
+                return False, f"한글 부족({hangul_count}자) 및 미번역 일본어 문자({jp_count}자) 잔존 ('{sample_jp}...'): 즉시 거부"
+
+        # ── 2. 한자(Hanja/CJK) 원문 잔존 검증 ────────────────────────────────
         # Exclude legitimate bracketed Hanja annotations (e.g. 양강패절(陽剛霸絕))
         clean_body_no_brackets = re.sub(
             r'[\uac00-\ud7af]+\s*[\(\（][\u4e00-\u9fff\s]+[\)\）]',
@@ -68,9 +97,7 @@ class SessionManager:
             clean_body
         )
         hanja_matches = cls.HANJA_REGEX.findall(clean_body_no_brackets)
-        hangul_matches = re.findall(r'[\uac00-\ud7af]', clean_body)
         hanja_count = len(hanja_matches)
-        hangul_count = len(hangul_matches)
 
         if hanja_count > 0:
             total_clean_len = len(clean_body.strip())
@@ -102,7 +129,7 @@ class SessionManager:
         return bool(cls.POLLUTION_REGEX.search(text))
 
     @classmethod
-    def sanitize_translated_chunks(cls, chunks: Dict[int, str]) -> Tuple[Dict[int, str], int]:
+    def sanitize_translated_chunks(cls, chunks: Dict[int, str], lang_code: Optional[str] = "JA") -> Tuple[Dict[int, str], int]:
         """
         Filters out contaminated / corrupted chunks from checkpoint dictionary.
         Returns: (sanitized_dict, purged_count)
@@ -111,7 +138,7 @@ class SessionManager:
         purged_count = 0
 
         for idx, text in chunks.items():
-            valid, reason = cls.is_chunk_valid(text)
+            valid, reason = cls.is_chunk_valid(text, lang_code=lang_code)
             if valid:
                 sanitized[idx] = text
             else:
@@ -227,8 +254,9 @@ class SessionManager:
             with open(meta_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
                 if "translated_chunks" in data:
+                    session_lang = data.get("language", "JA")
                     raw_chunks = {int(k): v for k, v in data["translated_chunks"].items()}
-                    clean_chunks, purged_count = cls.sanitize_translated_chunks(raw_chunks)
+                    clean_chunks, purged_count = cls.sanitize_translated_chunks(raw_chunks, lang_code=session_lang)
                     data["translated_chunks"] = clean_chunks
                     data["processed_count"] = len(clean_chunks)
                     if purged_count > 0:

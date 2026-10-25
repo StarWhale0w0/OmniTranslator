@@ -27,6 +27,67 @@ class FallbackTranslator:
     }
 
     @classmethod
+    def is_valid_translation(cls, candidate: Optional[str], original: str, source_lang: str = "JA") -> bool:
+        """
+        Validates that fallback translation is clean, non-empty, not a raw echo of original text,
+        and contains no residual untranslated Japanese characters (Hiragana/Katakana).
+        Returns False (rejecting translation) if validation fails.
+        """
+        if not candidate or not str(candidate).strip():
+            return False
+
+        cand_str = str(candidate).strip()
+        orig_str = str(original).strip()
+
+        # Clean tags & placeholders for content comparison
+        cand_clean = re.sub(r'<[^>]+>', '', cand_str)
+        orig_clean = re.sub(r'<[^>]+>', '', orig_str)
+        cand_clean = re.sub(r'\[\s*TAG\s*_?\s*\d+\s*\]', '', cand_clean, flags=re.IGNORECASE).strip()
+        orig_clean = re.sub(r'\[\s*TAG\s*_?\s*\d+\s*\]', '', orig_clean, flags=re.IGNORECASE).strip()
+
+        # Check if source actually had CJK or translatable text
+        orig_has_cjk = bool(re.search(r'[\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF]', orig_clean))
+        if not orig_has_cjk:
+            # For non-CJK strings (pure numbers, symbols, tags), identical text is acceptable if non-empty
+            return bool(cand_clean or cand_str)
+
+        # 1. Exact raw copy check
+        if cand_str == orig_str or cand_clean == orig_clean:
+            logger.warning("Fallback rejected: translation is exact raw copy of source text.")
+            return False
+
+        # 2. Japanese (JA) specific integrity validation
+        is_ja = not source_lang or str(source_lang).upper() in ("JA", "JP", "JAPANESE")
+        if is_ja:
+            jp_matches = re.findall(r'[\u3040-\u309F\u30A0-\u30FF]', cand_clean)
+            jp_count = len(jp_matches)
+            hangul_matches = re.findall(r'[\uAC00-\uD7AF]', cand_clean)
+            hangul_count = len(hangul_matches)
+
+            # Rule: Hiragana/Katakana >= 3 -> reject
+            if jp_count >= 3:
+                sample_jp = "".join(jp_matches[:10])
+                logger.warning(
+                    f"Fallback rejected: {jp_count} Hiragana/Katakana characters retained ('{sample_jp}...')"
+                )
+                return False
+
+            # Rule: Hangul < 10 but Japanese characters exist -> reject
+            if hangul_count < 10 and jp_count > 0:
+                sample_jp = "".join(jp_matches[:10])
+                logger.warning(
+                    f"Fallback rejected: Hangul < 10 ({hangul_count}) and Japanese characters exist ({jp_count}: '{sample_jp}...')"
+                )
+                return False
+
+            # Rule: Source has CJK but translation has zero Hangul
+            if hangul_count == 0 and len(orig_clean) > 0:
+                logger.warning("Fallback rejected: Source has Japanese/CJK but translation contains 0 Hangul.")
+                return False
+
+        return True
+
+    @classmethod
     def _translate_gtx_sync(cls, text: str, src: str, tgt: str) -> Optional[str]:
         """Translates text using direct Google Translate endpoint with paragraph splitting."""
         if not text or not text.strip():
@@ -99,23 +160,22 @@ class FallbackTranslator:
                 return translator.translate(text)
 
             result = await loop.run_in_executor(None, _dt_run)
-            if result and result.strip() and result.strip() != text.strip():
-                # Verify that translation actually contains Korean characters
-                hangul_count = len(re.findall(r'[\uac00-\ud7af]', result))
-                if hangul_count >= 3 or len(result) < 15:
-                    logger.info(f"Fallback GoogleTranslator (deep-translator) succeeded: {len(text)} -> {len(result)} chars.")
-                    return result
+            if cls.is_valid_translation(result, text, source_lang=source_lang):
+                logger.info(f"Fallback GoogleTranslator (deep-translator) succeeded: {len(text)} -> {len(result)} chars.")
+                return result
+            elif result:
+                logger.warning("Fallback deep_translator result rejected due to untranslated/echoed content.")
         except Exception as e:
             logger.warning(f"deep_translator GoogleTranslator failed ({e}). Proceeding to direct GTX endpoint...")
 
         # 2. Attempt direct GTX endpoint as robust secondary channel
         try:
             gtx_result = await loop.run_in_executor(None, lambda: cls._translate_gtx_sync(text, src, tgt))
-            if gtx_result and gtx_result.strip() and gtx_result.strip() != text.strip():
-                hangul_count = len(re.findall(r'[\uac00-\ud7af]', gtx_result))
-                if hangul_count >= 3 or len(gtx_result) < 15:
-                    logger.info(f"Fallback GoogleTranslator (direct GTX) succeeded: {len(text)} -> {len(gtx_result)} chars.")
-                    return gtx_result
+            if cls.is_valid_translation(gtx_result, text, source_lang=source_lang):
+                logger.info(f"Fallback GoogleTranslator (direct GTX) succeeded: {len(text)} -> {len(gtx_result)} chars.")
+                return gtx_result
+            elif gtx_result:
+                logger.warning("Fallback direct GTX result rejected due to untranslated/echoed content.")
         except Exception as e:
             logger.error(f"Fallback direct GTX endpoint failed: {e}")
 
@@ -185,23 +245,50 @@ class FallbackTranslator:
         if translated_payload:
             parts = re.split(r'\n?\s*---\s*OMNI_NODE_SPLIT\s*---\s*\n?', translated_payload, flags=re.IGNORECASE)
             if len(parts) == len(text_nodes):
-                translated_parts = [p.strip() for p in parts]
+                all_parts_valid = True
+                temp_parts = []
+                for (_, orig_text), trans_p in zip(text_nodes, parts):
+                    p_strip = trans_p.strip()
+                    if not cls.is_valid_translation(p_strip, orig_text, source_lang=source_lang):
+                        all_parts_valid = False
+                        break
+                    temp_parts.append(p_strip)
+                if all_parts_valid:
+                    translated_parts = temp_parts
 
-        # If delimiter batching failed or count mismatched, fallback to parallel per-node translation
+        # If delimiter batching failed, mismatched, or contained invalid parts, fallback to parallel per-node translation
         if not translated_parts:
-            logger.info(f"Batch delimiter translation mismatch. Falling back to concurrent per-node translation ({len(text_nodes)} nodes)...")
-            async def _trans_single(txt: str) -> str:
+            logger.info(f"Batch delimiter translation mismatch/invalid. Falling back to concurrent per-node translation ({len(text_nodes)} nodes)...")
+            async def _trans_single(txt: str) -> Optional[str]:
                 res = await cls.translate_async(txt.strip(), source_lang=source_lang, target_lang=target_lang)
-                return res.strip() if res else txt
+                if res and cls.is_valid_translation(res.strip(), txt, source_lang=source_lang):
+                    return res.strip()
+                orig_has_cjk = bool(re.search(r'[\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF]', txt))
+                if not orig_has_cjk:
+                    return res.strip() if res else txt.strip()
+                return None
 
             translated_parts = await asyncio.gather(*[_trans_single(t) for _, t in text_nodes])
 
+        # Validate that no CJK text node failed (never return partial raw Japanese!)
+        for (_, orig_text), trans_text in zip(text_nodes, translated_parts):
+            orig_has_cjk = bool(re.search(r'[\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF]', orig_text))
+            if orig_has_cjk and (trans_text is None or not cls.is_valid_translation(trans_text, orig_text, source_lang=source_lang)):
+                logger.warning(
+                    f"Fallback HTML translation failed on text node: '{orig_text[:30]}...' -> '{str(trans_text)[:30]}...'"
+                )
+                return None
+
         # Replace text in DOM
         for (node, orig_text), trans_text in zip(text_nodes, translated_parts):
-            if trans_text:
-                # Preserve leading/trailing whitespace if present in original text
+            if trans_text is not None:
                 leading = orig_text[:len(orig_text) - len(orig_text.lstrip())]
                 trailing = orig_text[len(orig_text.rstrip()):]
                 node.replace_with(f"{leading}{trans_text}{trailing}")
 
-        return str(soup)
+        result_html = str(soup)
+        if not cls.is_valid_translation(result_html, html_content, source_lang=source_lang):
+            logger.warning("Fallback translate_html_async generated invalid/untranslated HTML. Returning None.")
+            return None
+
+        return result_html

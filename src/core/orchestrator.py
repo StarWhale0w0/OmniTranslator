@@ -321,7 +321,7 @@ class TranslationOrchestrator(QtCore.QObject):
         async def translate_single_chunk(idx: int, text_chunk: str) -> str:
             if idx in translated_dict:
                 cached_text = translated_dict[idx]
-                is_valid, reason = SessionManager.is_chunk_valid(cached_text)
+                is_valid, reason = SessionManager.is_chunk_valid(cached_text, lang_code=language)
                 if is_valid:
                     return cached_text
                 else:
@@ -643,7 +643,7 @@ class TranslationOrchestrator(QtCore.QObject):
                         if not is_epub:
                             fb_unmasked = TextCleaner.strip_html_tags(fb_unmasked)
 
-                        is_fb_valid, fb_invalid_reason = SessionManager.is_chunk_valid(fb_unmasked)
+                        is_fb_valid, fb_invalid_reason = SessionManager.is_chunk_valid(fb_unmasked, lang_code=language)
                         if is_fb_valid:
                             logger.info(
                                 f"Chunk #{idx+1}: [2차 폴백 성공] 구글 번역 대체 및 용어집 교정 완료 ({len(fb_unmasked)}자)."
@@ -674,7 +674,7 @@ class TranslationOrchestrator(QtCore.QObject):
                     self.signals.log_emitted.emit(
                         "ERROR",
                         f"🚨 [번역 일시 정지] Chunk #{idx+1}: Gemini 및 2차 폴백(구글 번역) 모두 응답 불가. "
-                        f"중국어 원문 오염 저장을 차단하고 작업을 안전 일시 정지합니다."
+                        f"미번역({language}) 원문 오염 저장을 차단하고 작업을 안전 일시 정지합니다."
                     )
                     self.signals.status_changed.emit(f"Chunk #{idx+1} 번역 실패 (일시 정지됨 - API 키 및 네트워크 확인 필요)")
                     self.pause()
@@ -702,10 +702,10 @@ class TranslationOrchestrator(QtCore.QObject):
                     if fb_rescue and fb_rescue.strip():
                         final_translated = TagMasker.unmask_tags(fb_rescue, tag_map)
                     else:
-                        final_translated = text_chunk
+                        final_translated = ""
 
                 # 6. Final Integrity Validation before saving to Checkpoint
-                is_valid, invalid_reason = SessionManager.is_chunk_valid(final_translated)
+                is_valid, invalid_reason = SessionManager.is_chunk_valid(final_translated, lang_code=language)
                 if not is_valid:
                     logger.warning(
                         f"Chunk #{idx+1}: Gemini 산출물 최종 무결성 검증 탈락 ({invalid_reason}). "
@@ -736,7 +736,7 @@ class TranslationOrchestrator(QtCore.QObject):
                             )
                         if not is_epub:
                             fb_unmasked = TextCleaner.strip_html_tags(fb_unmasked)
-                        is_fb_valid, _ = SessionManager.is_chunk_valid(fb_unmasked)
+                        is_fb_valid, fb_rescue_reason = SessionManager.is_chunk_valid(fb_unmasked, lang_code=language)
                         if is_fb_valid:
                             logger.info(f"Chunk #{idx+1}: 2차 폴백 번역으로 성공적 긴급 구제 완료 (용어집 적용).")
                             final_translated = fb_unmasked

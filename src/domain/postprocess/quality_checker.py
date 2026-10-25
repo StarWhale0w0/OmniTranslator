@@ -380,6 +380,25 @@ class QualityChecker:
                     "issue": issue
                 }
 
+        # 3.9. Untranslated Japanese (Hiragana/Katakana) Residual Check
+        jp_matches = re.findall(r'[\u3040-\u309f\u30a0-\u30ff]', trans_text_clean)
+        jp_count = len(jp_matches)
+        if jp_count >= 3 or (hangul_count < 10 and jp_count > 0):
+            sample_jp = "".join(jp_matches[:10])
+            issue = f"UNTRANSLATED_JAPANESE_DETECTED (번역문 내 미번역 히라가나/가타카나 {jp_count}자 잔존: '{sample_jp}...')"
+            logger.warning(f"Quality Check Alert: {issue}")
+            return {
+                "is_suspicious": True,
+                "is_critical": True,
+                "is_content_drop": False,
+                "is_repetition": False,
+                "is_untranslated_hanja": False,
+                "is_untranslated_japanese": True,
+                "is_hallucination": False,
+                "ratio": trans_len / src_len if src_len > 0 else 0.0,
+                "issue": issue
+            }
+
         # 4. Length Ratio Anomaly Check
         ratio = trans_len / src_len if src_len > 0 else 1.0
         is_suspicious = False
