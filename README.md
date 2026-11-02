@@ -113,5 +113,12 @@ EPUB과 TXT 문서를 지원하며, 다중 API 키 로테이션, 지능형 용�
 4. 작업 도중 API 쿼터가 소진되어 일시정지된 경우, 쿨다운 대기 후 [계속(Resume)]을 누르면 번역되지 않은 청크부터 안전하게 이어받아 완성합니다.
 
 ## ⚠️ 면책 조항 (Disclaimer)
-본 프로젝트는 개인 학습 및 오픈소스 연구 목적으로 제작된 도구입니다. 
-사용자가 본 프로그램을 사용하여 처리하는 모든 콘텐츠의 저작권 준수 책임은 사용자 본인에게 있으며, 개발자는 사용자의 저작권 침해 행위나 생성된 결과물에 대해 어떠한 법적 책임도 지지 않습니다.
+
+1. **목적 및 성격:** 본 프로젝트는 전자책(EPUB/TXT) 데이터 파이프라인 처리, 비동기 이벤트 루프 및 자연어 처리(NLP) 연구를 위해 제작된 독립적인 오픈소스 소프트웨어입니다.
+2. **콘텐츠 미포함:** 본 저장소 및 관련 패키지는 저작권의 보호를 받는 어떠한 소설 원문, 도서 데이터, 번역 산출물도 포함하거나 배포하지 않습니다.
+3. **법적 책임:** 본 프로그램을 사용하여 처리하는 모든 콘텐츠의 저작권 준수 및 관련 법령, 제3자 서비스(LLM API 등)의 이용 약관 준수 책임은 전적으로 프로그램을 실행하는 사용자 본인에게 있습니다.
+4. **침해 방조 금지:** 개발자는 타인의 지적재산권 침해나 무단 복제·배포 행위를 결코 권장하거나 방조하지 않습니다.
+
+---
+
+*This project is an independent open-source software developed for document processing and educational research. This software does not host, provide, or distribute any copyrighted texts or proprietary book datasets. Users are solely responsible for ensuring compliance with applicable copyright laws and third-party service terms.*
