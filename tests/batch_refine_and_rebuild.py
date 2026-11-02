@@ -1,3 +1,4 @@
+import os
 """
 Batch post-processing and EPUB rebuilder script to refine dialogue tone & endings across all chapters.
 """
@@ -7,7 +8,7 @@ import json
 import zipfile
 from pathlib import Path
 
-src_dir = Path(r"C:\Users\C\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Visual Studio Code\files\KB_fullstack\project\alone\번역기 프로그램 만들기\sample\OmniTranslator_Pro\src")
+src_dir = Path(__file__).resolve().parent.parent / "src"
 if str(src_dir) not in sys.path:
     sys.path.insert(0, str(src_dir))
 
@@ -91,7 +92,10 @@ def refine_and_rebuild_book(translated_epub_path: Path, original_epub_path: Path
                 print(f"Verified {name}: {len(soup.find_all('a'))} links in NAV.")
 
 
-sample_dir = Path(r"C:\Users\C\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Visual Studio Code\files\KB_fullstack\project\alone\번역기 프로그램 만들기\sample\tr_ch")
+sample_dir = Path(os.getenv("SAMPLE_DIR", Path(__file__).resolve().parent.parent.parent / "tr_ch"))
+if not sample_dir.exists():
+    print(f"Sample directory not found ({sample_dir}). Skipping batch refine.")
+    sys.exit(0)
 
 refine_and_rebuild_book(
     translated_epub_path=sample_dir / "灵异片演员app_초자연적app_translated.epub",

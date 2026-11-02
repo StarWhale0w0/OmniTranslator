@@ -1,27 +1,83 @@
-# Security & Configuration
+# ==============================================================================
+# Security & Credentials
+# ==============================================================================
 config.json
-*.meta.json
+config.local.json
+*.secret.json
 .env
+.env.*
 *.key
+*.pem
+*.token
 
-# Python Bytecode & Cache
+# ==============================================================================
+# Novel Translation Data, Checkpoints & Glossary
+# ==============================================================================
+*.meta.json
+*.meta.json.bak
+*.meta.json*
+*.glossary.json
+*.glossary.json.bak
+
+# Novel Source & Output eBooks / Texts (Prevent Copyright & Private Data Leak)
+sample/
+samples/
+test_data/
+tr_ch/
+tr_jp/
+tr_en/
+*.epub
+*.mobi
+*.azw3
+
+# ==============================================================================
+# Logs & Diagnostics
+# ==============================================================================
+logs/
+**/logs/
+*.log
+omni_translator.log
+
+# ==============================================================================
+# Python Bytecode, Caches & Environments
+# ==============================================================================
 __pycache__/
+**/__pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
 
-# Build & Dist
+# Virtual Environments
+.venv/
+venv/
+ENV/
+env/
+
+# Testing & Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Build & Distribution Artifacts
 build/
 dist/
 *.spec.bak
+*.egg-info/
 
-# Logs & Temporary Files
-logs/
-*.log
-scratch/
-tmp/
+# IDE & Editor Files
 .vscode/
 .idea/
-logs/
-*.log
+*.sublime-project
+*.sublime-workspace
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Temporary & Scratch Files
+scratch/
+tmp/
+temp/
+*.tmp

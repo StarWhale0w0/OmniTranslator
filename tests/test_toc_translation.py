@@ -1,3 +1,4 @@
+import os
 """
 Tests for Table of Contents (TOC) extraction, translation mapping,
 metadata synchronization, and EPUB packaging in OmniTranslator Pro.
@@ -46,7 +47,7 @@ def test_heading_extraction():
 
 def test_toc_sync_and_epub_rebuild():
     """Test TOC synchronization and EPUB packaging on sample translated book."""
-    sample_path = Path(r"C:\Users\C\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Visual Studio Code\files\KB_fullstack\project\alone\번역기 프로그램 만들기\sample\tr_ch\灵异片演员app_초자연적app_translated.epub")
+    sample_path = Path(os.getenv("SAMPLE_EPUB_PATH", Path(__file__).resolve().parent.parent.parent / "tr_ch" / "灵异片演员app_초자연적app_translated.epub"))
     if not sample_path.exists():
         print(f"Skipping sample test (file not found: {sample_path})")
         return

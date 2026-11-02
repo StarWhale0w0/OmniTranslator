@@ -1,3 +1,4 @@
+import os
 """
 Script to rebuild sample EPUBs with verified Korean TOC, NCX, NAV, and meta.json.
 """
@@ -6,7 +7,7 @@ import sys
 import zipfile
 from pathlib import Path
 
-src_dir = Path(r"C:\Users\C\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Visual Studio Code\files\KB_fullstack\project\alone\번역기 프로그램 만들기\sample\OmniTranslator_Pro\src")
+src_dir = Path(__file__).resolve().parent.parent / "src"
 if str(src_dir) not in sys.path:
     sys.path.insert(0, str(src_dir))
 
@@ -84,7 +85,10 @@ def rebuild_sample_book(translated_epub_path: Path, original_epub_path: Path):
                     print(f"    - <a href=\"{a.get('href')}\">{a.get_text().strip()}</a>")
 
 
-sample_dir = Path(r"C:\Users\C\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Visual Studio Code\files\KB_fullstack\project\alone\번역기 프로그램 만들기\sample\tr_ch")
+sample_dir = Path(os.getenv("SAMPLE_DIR", Path(__file__).resolve().parent.parent.parent / "tr_ch"))
+if not sample_dir.exists():
+    print(f"Sample directory not found ({sample_dir}). Skipping rebuild.")
+    sys.exit(0)
 
 rebuild_sample_book(
     translated_epub_path=sample_dir / "灵异片演员app_초자연적app_translated.epub",

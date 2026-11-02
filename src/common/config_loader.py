@@ -2,6 +2,7 @@
 OmniTranslator Pro - Configuration Loader & Persistence Manager
 """
 
+import os
 import json
 from pathlib import Path
 from typing import Dict, Any, Tuple
@@ -52,7 +53,14 @@ class ConfigLoader:
         if not config_path.exists():
             logger.info(f"config.json not found. Creating default configuration at: {config_path}")
             cls.save_config(DEFAULT_CONFIG)
-            return DEFAULT_CONFIG.copy()
+            cfg = DEFAULT_CONFIG.copy()
+            env_keys = os.getenv("GEMINI_API_KEY", "")
+            if env_keys:
+                parsed_keys = [k.strip() for k in env_keys.split(",") if k.strip()]
+                if parsed_keys:
+                    logger.info(f"Loaded {len(parsed_keys)} API key(s) from GEMINI_API_KEY environment variable.")
+                    cfg["api_keys"] = parsed_keys
+            return cfg
 
         try:
             with open(config_path, "r", encoding="utf-8") as f:
@@ -62,6 +70,15 @@ class ConfigLoader:
             if has_changes:
                 logger.info("Merged missing default configuration keys into config.json.")
                 cls.save_config(merged)
+
+            # Fallback to environment variable GEMINI_API_KEY if api_keys is empty
+            if not merged.get("api_keys"):
+                env_keys = os.getenv("GEMINI_API_KEY", "")
+                if env_keys:
+                    parsed_keys = [k.strip() for k in env_keys.split(",") if k.strip()]
+                    if parsed_keys:
+                        logger.info(f"Loaded {len(parsed_keys)} API key(s) from GEMINI_API_KEY environment variable.")
+                        merged["api_keys"] = parsed_keys
 
             return merged
 

@@ -75,8 +75,9 @@ hidden_imports = [
 
 datas = [
     ('assets', 'assets'),
-    ('config.json', '.')
 ]
+if os.path.exists('config.example.json'):
+    datas.append(('config.example.json', '.'))
 
 # Check icon file existence
 icon_file = 'assets/icons/app_icon.ico'
